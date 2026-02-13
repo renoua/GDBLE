@@ -129,7 +129,7 @@ impl BleDevice {
                 }
             };
 
-            // Handle result on main thread
+            // Handle result on main thread using deferred call
             match result {
                 Ok(_) => {
                     ble_debug!("Attempting to emit connected signal for {}", address);
@@ -311,7 +311,7 @@ impl BleDevice {
                     let services_array: Array<Dictionary> =
                         service_infos.iter().map(|s| s.to_dictionary()).collect();
 
-                    // Emit signal on main thread
+                    // Emit signal using deferred call
                     if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
                         obj.call_deferred(
                             "_on_services_discovered",
@@ -324,7 +324,7 @@ impl BleDevice {
                 Err(error) => {
                     error.log_error();
 
-                    // Call back to main thread to emit signal
+                    // Call back to main thread using deferred call
                     if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
                         obj.call_deferred(
                             "_on_operation_failed",
@@ -425,7 +425,7 @@ impl BleDevice {
                             // Convert Vec<u8> to PackedByteArray
                             let packed_data = PackedByteArray::from(&data[..]);
 
-                            // Call back to main thread to emit signal
+                            // Call back to main thread using deferred call
                             if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
                             {
                                 obj.call_deferred(
@@ -443,7 +443,7 @@ impl BleDevice {
                             let error = BleError::ReadFailed(e.to_string());
                             error.log_error();
 
-                            // Call back to main thread to emit signal
+                            // Call back to main thread using deferred call
                             if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
                             {
                                 obj.call_deferred(
@@ -467,7 +467,7 @@ impl BleDevice {
                 ));
                 error.log_error();
 
-                // Call back to main thread to emit signal
+                // Call back to main thread using deferred call
                 if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
                     obj.call_deferred(
                         "_on_operation_failed",
@@ -574,7 +574,7 @@ impl BleDevice {
                                 char_uuid_str
                             );
 
-                            // Call back to main thread to emit signal
+                            // Call back to main thread using deferred call
                             if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
                             {
                                 obj.call_deferred(
@@ -589,7 +589,7 @@ impl BleDevice {
                             let error = BleError::WriteFailed(e.to_string());
                             error.log_error();
 
-                            // Call back to main thread to emit signal
+                            // Call back to main thread using deferred call
                             if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
                             {
                                 obj.call_deferred(
@@ -613,7 +613,7 @@ impl BleDevice {
                 ));
                 error.log_error();
 
-                // Call back to main thread to emit signal
+                // Call back to main thread using deferred call
                 if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
                     obj.call_deferred(
                         "_on_operation_failed",
@@ -779,7 +779,7 @@ impl BleDevice {
                                             let packed_data =
                                                 PackedByteArray::from(&notification.value[..]);
 
-                                            // Call back to main thread to emit signal
+                                            // Call back to main thread using deferred call
                                             if let Ok(mut obj) =
                                                 Gd::<BleDevice>::try_from_instance_id(instance_id)
                                             {
@@ -806,7 +806,7 @@ impl BleDevice {
                             let error = BleError::SubscribeFailed(e.to_string());
                             error.log_error();
 
-                            // Call back to main thread to emit signal
+                            // Call back to main thread using deferred call
                             if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
                             {
                                 obj.call_deferred(
@@ -830,7 +830,7 @@ impl BleDevice {
                 ));
                 error.log_error();
 
-                // Call back to main thread to emit signal
+                // Call back to main thread using deferred call
                 if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
                     obj.call_deferred(
                         "_on_operation_failed",
@@ -921,7 +921,7 @@ impl BleDevice {
                             let error = BleError::UnsubscribeFailed(e.to_string());
                             error.log_error();
 
-                            // Call back to main thread to emit signal
+                            // Call back to main thread using deferred call
                             if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
                             {
                                 obj.call_deferred(
@@ -945,7 +945,7 @@ impl BleDevice {
                 ));
                 error.log_error();
 
-                // Call back to main thread to emit signal
+                // Call back to main thread using deferred call
                 if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
                     obj.call_deferred(
                         "_on_operation_failed",

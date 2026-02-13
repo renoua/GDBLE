@@ -15,41 +15,45 @@ pub fn is_debug_mode() -> bool {
 }
 
 /// 调试日志宏 - 仅在调试模式下输出
+/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_debug {
     ($($arg:tt)*) => {
         if $crate::types::is_debug_mode() {
-            godot::prelude::godot_print!("[BLE Debug] {}", format!($($arg)*));
+            eprintln!("[BLE Debug] {}", format!($($arg)*));
         }
     };
 }
 
 /// 信息日志宏 - 仅在调试模式下输出
+/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_info {
     ($($arg:tt)*) => {
         if $crate::types::is_debug_mode() {
-            godot::prelude::godot_print!("[BLE Info] {}", format!($($arg)*));
+            eprintln!("[BLE Info] {}", format!($($arg)*));
         }
     };
 }
 
 /// 警告日志宏 - 仅在调试模式下输出
+/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_warn {
     ($($arg:tt)*) => {
         if $crate::types::is_debug_mode() {
-            godot::prelude::godot_warn!("[BLE Warning] {}", format!($($arg)*));
+            eprintln!("[BLE Warning] {}", format!($($arg)*));
         }
     };
 }
 
 /// 错误日志宏 - 仅在调试模式下输出
+/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_error {
     ($($arg:tt)*) => {
         if $crate::types::is_debug_mode() {
-            godot::prelude::godot_error!("[BLE Error] {}", format!($($arg)*));
+            eprintln!("[BLE Error] {}", format!($($arg)*));
         }
     };
 }
@@ -284,14 +288,14 @@ impl BleError {
         )
     }
 
-    /// 记录错误到 Godot 控制台
+    /// 记录错误到控制台（线程安全）
     pub fn log_error(&self) {
-        godot_error!("[BLE Error] {}: {}", self.error_code(), self.to_string());
+        eprintln!("[BLE Error] {}: {}", self.error_code(), self.to_string());
     }
 
-    /// 记录警告到 Godot 控制台
+    /// 记录警告到控制台（线程安全）
     pub fn log_warning(&self) {
-        godot_warn!("[BLE Warning] {}: {}", self.error_code(), self.to_string());
+        eprintln!("[BLE Warning] {}: {}", self.error_code(), self.to_string());
     }
 }
 
