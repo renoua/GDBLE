@@ -114,17 +114,17 @@ impl BleDevice {
 
         // Execute connection asynchronously
         runtime.spawn(async move {
-            ble_debug!("About to call peripheral.connect() for {}", address);
+            // ble_debug!("About to call peripheral.connect() for {}", address);
             
             let result = match peripheral.connect().await {
                 Ok(_) => {
-                    ble_debug!("peripheral.connect() returned Ok for {}", address);
+                    // ble_debug!("peripheral.connect() returned Ok for {}", address);
                     *is_connected.lock().unwrap() = true;
-                    ble_info!("Successfully connected to device: {}", address);
+                    // ble_info!("Successfully connected to device: {}", address);
                     Ok(())
                 }
                 Err(e) => {
-                    ble_debug!("peripheral.connect() returned Err for {}: {}", address, e);
+                    // ble_debug!("peripheral.connect() returned Err for {}: {}", address, e);
                     Err(BleError::ConnectionFailed(e.to_string()))
                 }
             };
@@ -132,20 +132,20 @@ impl BleDevice {
             // Handle result on main thread
             match result {
                 Ok(_) => {
-                    ble_debug!("Attempting to emit connected signal for {}", address);
+                    // ble_debug!("Attempting to emit connected signal for {}", address);
                     if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                        ble_debug!("Found device instance, calling _on_connect_success");
+                        // ble_debug!("Found device instance, calling _on_connect_success");
                         obj.call_deferred("_on_connect_success", &[]);
                     } else {
                         ble_error!("Failed to get device instance for callback");
                     }
                 }
                 Err(error) => {
-                    ble_debug!("Connection failed for device: {}", address);
+                    // ble_debug!("Connection failed for device: {}", address);
                     error.log_error();
                     
                     if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                        ble_debug!("Found device instance, calling _on_connect_failed");
+                        // ble_debug!("Found device instance, calling _on_connect_failed");
                         obj.call_deferred(
                             "_on_connect_failed",
                             &[error.to_gstring().to_variant()],
@@ -180,7 +180,7 @@ impl BleDevice {
                     // Clear all subscriptions
                     let sub_count = subscribed_chars.lock().unwrap().len();
                     subscribed_chars.lock().unwrap().clear();
-                    ble_info!("Device {} disconnected successfully", address);
+                    // ble_info!("Device {} disconnected successfully", address);
                     if sub_count > 0 {
                         ble_debug!("Cleared {} subscriptions", sub_count);
                     }
@@ -748,10 +748,10 @@ impl BleDevice {
                                 .unwrap()
                                 .insert(char_uuid_str.to_lowercase());
 
-                            ble_info!(
-                                "Successfully subscribed to characteristic {}",
-                                char_uuid_str
-                            );
+                            // ble_info!(
+                            //     "Successfully subscribed to characteristic {}",
+                            //     char_uuid_str
+                            // );
 
                             // Set up notification handler
                             let peripheral_clone = peripheral.clone();
