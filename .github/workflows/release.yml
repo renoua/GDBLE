@@ -136,7 +136,7 @@ jobs:
           # Rename and copy with platform and architecture suffix
           case "${{ matrix.platform }}" in
             windows)
-              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/gdble.windows.x86_64.dll
+              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble.windows.x86_64.dll
               ;;
             macos)
               cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble.macos.x86_64.dylib
@@ -186,8 +186,8 @@ jobs:
           cp demo/addons/gdble/gdble.gdextension release/addons/gdble/
           
           # Copy Windows binary
-          if [ -f artifacts/gdble-windows/gdble.windows.x86_64.dll ]; then
-            cp artifacts/gdble-windows/gdble.windows.x86_64.dll release/addons/gdble/gdble.windows.x86_64.dll
+          if [ -f artifacts/gdble-windows/libgdble.windows.x86_64.dll ]; then
+            cp artifacts/gdble-windows/libgdble.windows.x86_64.dll release/addons/gdble/libgdble.windows.x86_64.dll
           fi
 
           # Copy macOS x86_64 binary
@@ -280,8 +280,8 @@ jobs:
           fi
           
           # Copy Windows binary
-          if [ -f artifacts/gdble-windows/gdble.windows.x86_64.dll ]; then
-            cp artifacts/gdble-windows/gdble.windows.x86_64.dll addons/gdble/gdble.windows.x86_64.dll
+          if [ -f artifacts/gdble-windows/libgdble.windows.x86_64.dll ]; then
+            cp artifacts/gdble-windows/libgdble.windows.x86_64.dll addons/gdble/libgdble.windows.x86_64.dll
             echo "✓ Updated Windows binary"
           fi
           

@@ -6,8 +6,8 @@ reloadable = true
 [libraries]
 linux.debug.x86_64 =     "res://addons/gdble/libgdble.linux.x86_64.so"
 linux.release.x86_64 =   "res://addons/gdble/libgdble.linux.x86_64.so"
-windows.debug.x86_64 =   "res://addons/gdble/gdble.windows.x86_64.dll"
-windows.release.x86_64 = "res://addons/gdble/gdble.windows.x86_64.dll"
+windows.debug.x86_64 =   "res://addons/gdble/libgdble.windows.x86_64.dll"
+windows.release.x86_64 = "res://addons/gdble/libgdble.windows.x86_64.dll"
 macos.debug =            "res://addons/gdble/libgdble.macos.x86_64.dylib"
 macos.release =          "res://addons/gdble/libgdble.macos.x86_64.dylib"
 macos.debug.arm64 =      "res://addons/gdble/libgdble.macos.arm64.dylib"
