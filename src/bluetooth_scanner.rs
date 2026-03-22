@@ -104,7 +104,7 @@ impl BluetoothScanner {
         
         let scan_result = self.adapter.start_scan(ScanFilter::default()).await;
         match &scan_result {
-            Ok(_) => ble_info!("Adapter start_scan() returned Ok"),
+            Ok(_) => {}, // ble_info!("Adapter start_scan() returned Ok"),
             Err(e) => ble_error!("Adapter start_scan() returned Err: {}", e),
         }
         
@@ -114,15 +114,15 @@ impl BluetoothScanner {
             error
         })?;
 
-        ble_info!("BLE scan started successfully");
+        // ble_info!("BLE scan started successfully");
 
         // Wait for scan duration with additional debugging
-        ble_debug!("Waiting for scan duration: {:?}", scan_duration);
+        // ble_debug!("Waiting for scan duration: {:?}", scan_duration);
         let result = timeout(scan_duration, self.collect_devices(device_tx)).await;
-        ble_debug!("Scan timeout completed, checking result...");
+        // ble_debug!("Scan timeout completed, checking result...");
 
         // Stop scanning
-        ble_debug!("Stopping adapter scan");
+        // ble_debug!("Stopping adapter scan");
         let stop_result = self.adapter.stop_scan().await;
 
         // Update scanning state
@@ -145,7 +145,7 @@ impl BluetoothScanner {
         
         match result {
             Ok(Ok(())) => {
-                ble_debug!("Scan collection completed successfully");
+                // ble_debug!("Scan collection completed successfully");
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -153,7 +153,7 @@ impl BluetoothScanner {
                 Err(e)
             }
             Err(_) => {
-                ble_debug!("Scan timeout reached (expected)");
+                // ble_debug!("Scan timeout reached (expected)");
                 Ok(())
             }
         }
@@ -245,12 +245,12 @@ impl BluetoothScanner {
 
                             let tx_power_level = properties.tx_power_level;
 
-                            ble_info!(
-                                "Discovered device: {} ({}), RSSI: {:?}",
-                                name.as_ref().unwrap_or(&"Unknown".to_string()),
-                                address,
-                                rssi
-                            );
+                            // ble_info!(
+                            //     "Discovered device: {} ({}), RSSI: {:?}",
+                            //     name.as_ref().unwrap_or(&"Unknown".to_string()),
+                            //     address,
+                            //     rssi
+                            // );
 
                             let device_info = DeviceInfo::new(
                                 address.clone(), 
@@ -353,7 +353,7 @@ impl BluetoothScanner {
             }
         }
 
-        ble_info!("Device collection completed. Discovered {} unique devices from {} events", device_discovery_count, event_count);
+        // ble_info!("Device collection completed. Discovered {} unique devices from {} events", device_discovery_count, event_count);
         Ok(())
     }
 
