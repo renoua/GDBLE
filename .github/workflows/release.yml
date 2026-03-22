@@ -368,9 +368,9 @@ jobs:
             
             ## 🆕 What's Updated in This Release
             
-            - **Linux Support**: Added Linux platform build support (x86_64)
-            
-            This release enables GDBLE to run on Linux systems, expanding cross-platform compatibility.
+            - **Thread Safety Fix**: Fixed panic caused by calling Godot API from background threads
+              - Changed logging macros from `godot_print!`/`godot_error!` to thread-safe `eprintln!`
+            - **API Update**: Replaced `Dictionary` type with `VarDictionary` (adapting to godot-rust 0.4.5 API changes)
             
             ## 🌍 Platform Support
             
