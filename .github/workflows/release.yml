@@ -366,21 +366,50 @@ jobs:
           body: |
             # GDBLE ${{ steps.get_version.outputs.version }}
             
-            ## 🆕 What's Updated in This Release
+            ## 🔧 Bug Fixes
             
-            - **Thread Safety Fix**: Fixed panic caused by calling Godot API from background threads
-              - Changed logging macros from `godot_print!`/`godot_error!` to thread-safe `eprintln!`
-            - **API Update**: Replaced `Dictionary` type with `VarDictionary` (adapting to godot-rust 0.4.5 API changes)
+            ### Critical Thread Safety Fix (Issue #11, #14)
+            
+            Fixed panic/hang caused by accessing Godot API from background threads:
+            
+            - **Root Cause**: `Gd<T>` implements `!Send` and `!Sync`, meaning it cannot be safely passed across threads. Previous code attempted to call Godot API methods from Tokio async tasks (background threads), triggering panics.
+            
+            - **Solution**: Implemented a channel-based event system:
+              - All async operations now send events through `mpsc::UnboundedSender` from background threads
+              - `BluetoothManager` processes events on the main thread via `process()` callback
+              - All Godot API calls (signals, etc.) are now executed on the main thread only
+            
+            - **Changes**:
+              - Added `BleDeviceEvent` enum to represent all device events
+              - Refactored `BleDevice` to use event channels instead of direct API calls
+              - Added event processing in `BluetoothManager::process()`
+              - Replaced all `godot_print!`/`godot_error!` with thread-safe `eprintln!` in logging macros
+            
+            ## 📋 API Changes
+            
+            - `Dictionary` type replaced with `VarDictionary` (godot-rust 0.4.5 compatibility)
             
             ## 🌍 Platform Support
             
-            - ✅ **Windows** 10+ (x86_64)
-            - ✅ **macOS** 10.15+ (x86_64, ARM64)
-            - ✅ **Linux** (x86_64)
-            - ⚠️ **Android** 5.0+ (API 21+, ARM64, x86_64) - Not tested, may not work correctly
+            | Platform | Architecture | Status |
+            |----------|--------------|--------|
+            | Windows 10+ | x86_64 | ✅ Tested |
+            | macOS 10.15+ | x86_64 | ✅ Supported |
+            | macOS 11+ | ARM64 (M1/M2) | ✅ Supported |
+            | Linux | x86_64 | ✅ Supported |
+            | Android 5.0+ | ARM64 | ⚠️ Not tested |
+            | Android 5.0+ | x86_64 | ⚠️ Not tested |
             
-            > ⚠️ **Note**: Android ARMv7 (32-bit) is not supported due to godot-ffi compatibility issues. Please use ARM64 or x86_64 architectures for Android builds.
+            > ⚠️ **Note**: Android ARMv7 (32-bit) is not supported due to godot-ffi compatibility issues.
             > 
-            > ⚠️ **Important**: Android support in this release has not been tested. While the code compiles successfully, actual functionality on Android devices is not guaranteed. Please test thoroughly before using in production.
+            > ⚠️ **Important**: Android builds compile successfully but have not been tested on actual devices. Please test thoroughly before production use.
+            
+            ## 🔄 Migration from 0.5.x
+            
+            No API changes required. Simply replace the addon files with the new version.
+            
+            ## 📝 Known Issues
+            
+            - None at this time. Please report any issues on GitHub.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
