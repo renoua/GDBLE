@@ -307,6 +307,85 @@ impl std::fmt::Display for BleError {
 
 impl std::error::Error for BleError {}
 
+/// 设备事件枚举 - 用于从后台线程发送事件到主线程
+#[derive(Clone, Debug)]
+pub enum BleDeviceEvent {
+    /// 连接成功
+    ConnectSuccess {
+        device_address: String,
+    },
+    /// 连接失败
+    ConnectFailed {
+        device_address: String,
+        error: String,
+    },
+    /// 断开连接
+    Disconnected {
+        device_address: String,
+    },
+    /// 服务发现完成
+    ServicesDiscovered {
+        device_address: String,
+        services: Vec<BleServiceInfo>,
+    },
+    /// 服务发现失败
+    ServiceDiscoveryFailed {
+        device_address: String,
+        error: String,
+    },
+    /// 特征值读取完成
+    CharacteristicRead {
+        device_address: String,
+        char_uuid: String,
+        data: Vec<u8>,
+    },
+    /// 特征值读取失败
+    CharacteristicReadFailed {
+        device_address: String,
+        char_uuid: String,
+        error: String,
+    },
+    /// 特征值写入完成
+    CharacteristicWritten {
+        device_address: String,
+        char_uuid: String,
+    },
+    /// 特征值写入失败
+    CharacteristicWriteFailed {
+        device_address: String,
+        char_uuid: String,
+        error: String,
+    },
+    /// 特征值通知
+    CharacteristicNotified {
+        device_address: String,
+        char_uuid: String,
+        data: Vec<u8>,
+    },
+    /// 订阅成功
+    SubscribeSuccess {
+        device_address: String,
+        char_uuid: String,
+    },
+    /// 订阅失败
+    SubscribeFailed {
+        device_address: String,
+        char_uuid: String,
+        error: String,
+    },
+    /// 取消订阅成功
+    UnsubscribeSuccess {
+        device_address: String,
+        char_uuid: String,
+    },
+    /// 取消订阅失败
+    UnsubscribeFailed {
+        device_address: String,
+        char_uuid: String,
+        error: String,
+    },
+}
+
 /// 适配器信息结构
 #[derive(Clone, Debug)]
 pub struct AdapterInfo {

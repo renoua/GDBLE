@@ -1,6 +1,7 @@
 use btleplug::api::Manager as _;
 use btleplug::platform::{Adapter, Manager};
 use godot::classes::notify::NodeNotification;
+use godot::classes::Object;
 use godot::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,7 @@ use tokio::sync::mpsc;
 use crate::ble_device::BleDevice;
 use crate::bluetooth_scanner::BluetoothScanner;
 use crate::runtime::RuntimeManager;
-use crate::types::{AdapterInfo, BleError, DeviceInfo, set_debug_mode, is_debug_mode};
+use crate::types::{AdapterInfo, BleDeviceEvent, BleError, DeviceInfo, set_debug_mode, is_debug_mode};
 use crate::{ble_debug, ble_info, ble_warn, ble_error};
 
 /// BluetoothManager is the main entry point for BLE functionality in Godot
@@ -37,6 +38,9 @@ pub struct BluetoothManager {
     /// Channel receiver for discovered devices (real-time)
     device_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<DeviceInfo>>>>,
 
+    /// Channel receiver for device events (thread-safe communication)
+    device_event_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<BleDeviceEvent>>>>,
+
     /// Map of connected devices by address
     devices: Arc<Mutex<HashMap<String, Gd<BleDevice>>>>,
 
@@ -47,7 +51,7 @@ pub struct BluetoothManager {
 #[godot_api]
 impl INode for BluetoothManager {
     fn init(base: Base<Node>) -> Self {
-        godot_print!("BluetoothManager: Initializing");
+        ble_info!("BluetoothManager: Initializing");
 
         Self {
             base,
@@ -56,6 +60,7 @@ impl INode for BluetoothManager {
             scanner: None,
             scan_complete_rx: None,
             device_rx: None,
+            device_event_rx: None,
             devices: Arc::new(Mutex::new(HashMap::new())),
             is_initialized: Arc::new(Mutex::new(false)),
         }
@@ -63,35 +68,29 @@ impl INode for BluetoothManager {
 
     /// Called when the node enters the scene tree
     fn ready(&mut self) {
-        godot_print!("BluetoothManager: Ready");
-        // Enable processing to check scan results
+        ble_info!("BluetoothManager: Ready");
         self.base_mut().set_process(true);
     }
 
     /// Called every frame to process scan results and discovered devices
     fn process(&mut self, _delta: f64) {
-        // Collect discovered devices (real-time)
         let mut devices_to_emit = Vec::new();
         if let Some(ref rx_arc) = self.device_rx {
             if let Ok(mut rx) = rx_arc.lock() {
-                // Collect all available devices
                 while let Ok(device_info) = rx.try_recv() {
                     devices_to_emit.push(device_info);
                 }
             }
         }
 
-        // Emit device_discovered signals
         for device_info in devices_to_emit {
             let dict = device_info.to_dictionary();
             self.base_mut()
                 .emit_signal("device_discovered", &[dict.to_variant()]);
         }
 
-        // Check for scan completion
         let complete_opt = if let Some(ref rx_arc) = self.scan_complete_rx {
             if let Ok(mut rx) = rx_arc.lock() {
-                // Try to receive scan completion (non-blocking)
                 rx.try_recv().ok()
             } else {
                 None
@@ -100,20 +99,15 @@ impl INode for BluetoothManager {
             None
         };
 
-        // Process scan completion if we got one
         if let Some(result) = complete_opt {
-            // Clear the receivers
             self.scan_complete_rx = None;
             self.device_rx = None;
 
-            // Process the result
             match result {
                 Ok(()) => {
-                    // Emit scan_stopped signal
                     self.base_mut().emit_signal("scan_stopped", &[]);
                 }
                 Err(error_msg) => {
-                    // Emit error signal
                     self.base_mut().emit_signal(
                         "error_occurred",
                         &[GString::from(error_msg.as_str()).to_variant()],
@@ -122,12 +116,14 @@ impl INode for BluetoothManager {
                 }
             }
         }
+
+        self.process_device_events();
     }
 
     /// Called when the node receives a notification
     fn on_notification(&mut self, what: NodeNotification) {
         if what == NodeNotification::PREDELETE {
-            godot_print!("BluetoothManager: Cleaning up resources");
+            ble_info!("BluetoothManager: Cleaning up resources");
             self.cleanup();
         }
     }
@@ -589,11 +585,14 @@ impl BluetoothManager {
             }
         };
 
-        // Create BleDevice instance
         ble_debug!("Creating BleDevice instance for {}", address_str);
-        let device = BleDevice::new(peripheral, runtime.clone());
+        
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<BleDeviceEvent>();
+        let event_tx = Arc::new(Mutex::new(event_tx));
+        self.device_event_rx = Some(Arc::new(Mutex::new(event_rx)));
 
-        // Store in device map
+        let device = BleDevice::new(peripheral, runtime.clone(), event_tx);
+
         {
             let mut devices = self.devices.lock().unwrap();
             devices.insert(address_str.clone(), device.clone());
@@ -601,33 +600,13 @@ impl BluetoothManager {
 
         ble_info!("Created BleDevice for {}", address_str);
 
-        // Emit device_connecting signal
         self.base_mut()
             .emit_signal("device_connecting", &[address.to_variant()]);
-
-        // Set up signal handlers for the device
-        {
-            let mut device_bind = device.clone();
-            let callable = self.base().callable("_on_device_connected_internal");
-            device_bind.connect("connected", &callable);
-        }
-
-        // Connect to device's disconnected signal
-        {
-            let mut device_bind = device.clone();
-            let callable = self.base().callable("_on_device_disconnected_internal");
-            device_bind.connect("disconnected", &callable);
-        }
 
         Some(device)
     }
 
     /// Disconnect a BLE device by address
-    ///
-    /// Disconnects the device and removes it from the internal device map.
-    ///
-    /// # Parameters
-    /// * `address` - The Bluetooth address of the device to disconnect
     #[func]
     pub fn disconnect_device(&mut self, address: GString) {
         let address_str = address.to_string();
@@ -639,12 +618,11 @@ impl BluetoothManager {
 
         match device {
             Some(mut dev) => {
-                godot_print!("BluetoothManager: Disconnecting device {}", address_str);
+                ble_info!("BluetoothManager: Disconnecting device {}", address_str);
                 dev.call("disconnect", &[]);
-                // Device will be removed from map when disconnected signal is emitted
             }
             None => {
-                godot_warn!(
+                ble_warn!(
                     "BluetoothManager: Device {} not found in connected devices",
                     address_str
                 );
@@ -653,12 +631,6 @@ impl BluetoothManager {
     }
 
     /// Get a connected device by address
-    ///
-    /// # Parameters
-    /// * `address` - The Bluetooth address of the device
-    ///
-    /// # Returns
-    /// The BleDevice instance if connected, None otherwise
     #[func]
     pub fn get_device(&self, address: GString) -> Option<Gd<BleDevice>> {
         let address_str = address.to_string();
@@ -676,61 +648,6 @@ impl BluetoothManager {
         devices.values().cloned().collect()
     }
 
-    /// Internal callback for device connected signal
-    #[func]
-    fn _on_device_connected_internal(&mut self) {
-        // Find which device connected by checking connection status
-        let connected_address = {
-            let devices = self.devices.lock().unwrap();
-            let mut found_address = None;
-            for (address, device) in devices.iter() {
-                let is_connected = device.bind().is_connected();
-                if is_connected {
-                    found_address = Some(address.clone());
-                    break;
-                }
-            }
-            found_address
-        };
-
-        if let Some(address) = connected_address {
-            godot_print!("BluetoothManager: Device {} connected", address);
-            self.base_mut().emit_signal(
-                "device_connected",
-                &[GString::from(address.as_str()).to_variant()],
-            );
-        }
-    }
-
-    /// Internal callback for device disconnected signal
-    #[func]
-    fn _on_device_disconnected_internal(&mut self) {
-        // Find which device disconnected and remove it from the map
-        let to_remove = {
-            let devices = self.devices.lock().unwrap();
-            let mut disconnected = Vec::new();
-            for (address, device) in devices.iter() {
-                let is_connected = device.bind().is_connected();
-                if !is_connected {
-                    disconnected.push(address.clone());
-                }
-            }
-            disconnected
-        };
-
-        for address in to_remove {
-            {
-                let mut devices = self.devices.lock().unwrap();
-                devices.remove(&address);
-            }
-            godot_print!("BluetoothManager: Device {} disconnected and removed from map", address);
-            self.base_mut().emit_signal(
-                "device_disconnected",
-                &[GString::from(address.as_str()).to_variant()],
-            );
-        }
-    }
-
     /// Async helper to get the Bluetooth adapter
     async fn get_adapter_async() -> Result<Adapter, BleError> {
         let manager = Manager::new()
@@ -743,6 +660,188 @@ impl BluetoothManager {
             .map_err(|e| BleError::InitializationFailed(e.to_string()))?;
 
         adapters.into_iter().next().ok_or(BleError::AdapterNotFound)
+    }
+
+    /// Process device events from background threads (called from process())
+    fn process_device_events(&mut self) {
+        let mut events_to_process = Vec::new();
+        
+        if let Some(ref rx_arc) = self.device_event_rx {
+            if let Ok(mut rx) = rx_arc.lock() {
+                while let Ok(event) = rx.try_recv() {
+                    events_to_process.push(event);
+                }
+            }
+        }
+
+        for event in events_to_process {
+            self.handle_device_event(event);
+        }
+    }
+
+    /// Handle a device event on the main thread
+    fn handle_device_event(&mut self, event: BleDeviceEvent) {
+        match event {
+            BleDeviceEvent::ConnectSuccess { device_address } => {
+                ble_info!("Device {} connected successfully", device_address);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal("connected", &[]);
+                }
+                self.base_mut().emit_signal(
+                    "device_connected",
+                    &[GString::from(&device_address).to_variant()],
+                );
+            }
+            BleDeviceEvent::ConnectFailed { device_address, error } => {
+                ble_error!("Device {} connection failed: {}", device_address, error);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "connection_failed",
+                        &[GString::from(&error).to_variant()],
+                    );
+                }
+            }
+            BleDeviceEvent::Disconnected { device_address } => {
+                ble_info!("Device {} disconnected", device_address);
+                {
+                    let mut devices = self.devices.lock().unwrap();
+                    devices.remove(&device_address);
+                }
+                self.base_mut().emit_signal(
+                    "device_disconnected",
+                    &[GString::from(&device_address).to_variant()],
+                );
+            }
+            BleDeviceEvent::ServicesDiscovered { device_address, services } => {
+                ble_info!("Device {} discovered {} services", device_address, services.len());
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let services_array: Array<VarDictionary> =
+                        services.iter().map(|s| s.to_dictionary()).collect();
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "services_discovered",
+                        &[services_array.to_variant()],
+                    );
+                }
+            }
+            BleDeviceEvent::ServiceDiscoveryFailed { device_address, error } => {
+                ble_error!("Device {} service discovery failed: {}", device_address, error);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "operation_failed",
+                        &[
+                            GString::from("discover_services").to_variant(),
+                            GString::from(&error).to_variant(),
+                        ],
+                    );
+                }
+            }
+            BleDeviceEvent::CharacteristicRead { device_address, char_uuid, data } => {
+                ble_debug!("Device {} read {} bytes from {}", device_address, data.len(), char_uuid);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let packed_data = PackedByteArray::from(&data[..]);
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "characteristic_read",
+                        &[
+                            GString::from(&char_uuid).to_variant(),
+                            packed_data.to_variant(),
+                        ],
+                    );
+                }
+            }
+            BleDeviceEvent::CharacteristicReadFailed { device_address, char_uuid, error } => {
+                ble_error!("Device {} failed to read {}: {}", device_address, char_uuid, error);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "operation_failed",
+                        &[
+                            GString::from("read_characteristic").to_variant(),
+                            GString::from(&error).to_variant(),
+                        ],
+                    );
+                }
+            }
+            BleDeviceEvent::CharacteristicWritten { device_address, char_uuid } => {
+                ble_debug!("Device {} wrote to {}", device_address, char_uuid);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "characteristic_written",
+                        &[GString::from(&char_uuid).to_variant()],
+                    );
+                }
+            }
+            BleDeviceEvent::CharacteristicWriteFailed { device_address, char_uuid, error } => {
+                ble_error!("Device {} failed to write {}: {}", device_address, char_uuid, error);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "operation_failed",
+                        &[
+                            GString::from("write_characteristic").to_variant(),
+                            GString::from(&error).to_variant(),
+                        ],
+                    );
+                }
+            }
+            BleDeviceEvent::CharacteristicNotified { device_address, char_uuid, data } => {
+                ble_debug!("Device {} notification from {}: {} bytes", device_address, char_uuid, data.len());
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let packed_data = PackedByteArray::from(&data[..]);
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "characteristic_notified",
+                        &[
+                            GString::from(&char_uuid).to_variant(),
+                            packed_data.to_variant(),
+                        ],
+                    );
+                }
+            }
+            BleDeviceEvent::SubscribeSuccess { device_address, char_uuid } => {
+                ble_info!("Device {} subscribed to {}", device_address, char_uuid);
+            }
+            BleDeviceEvent::SubscribeFailed { device_address, char_uuid, error } => {
+                ble_error!("Device {} failed to subscribe {}: {}", device_address, char_uuid, error);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "operation_failed",
+                        &[
+                            GString::from("subscribe_characteristic").to_variant(),
+                            GString::from(&error).to_variant(),
+                        ],
+                    );
+                }
+            }
+            BleDeviceEvent::UnsubscribeSuccess { device_address, char_uuid } => {
+                ble_info!("Device {} unsubscribed from {}", device_address, char_uuid);
+            }
+            BleDeviceEvent::UnsubscribeFailed { device_address, char_uuid, error } => {
+                ble_error!("Device {} failed to unsubscribe {}: {}", device_address, char_uuid, error);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.emit_signal(
+                        "operation_failed",
+                        &[
+                            GString::from("unsubscribe_characteristic").to_variant(),
+                            GString::from(&error).to_variant(),
+                        ],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Get a device by address (internal helper)
+    fn get_device_by_address(&self, address: &str) -> Option<Gd<BleDevice>> {
+        let devices = self.devices.lock().unwrap();
+        devices.get(address).cloned()
     }
 
     /// Clean up resources when the node is destroyed
