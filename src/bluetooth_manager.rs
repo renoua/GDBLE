@@ -146,16 +146,16 @@ impl BluetoothManager {
     /// Signal emitted when a device is discovered during scanning
     ///
     /// # Parameters
-    /// * `device_info` - Dictionary containing device information
+    /// * `device_info` - VarDictionary containing device information
     #[signal]
-    fn device_discovered(device_info: Dictionary);
+    fn device_discovered(device_info: VarDictionary);
 
     /// Signal emitted when a device's information is updated
     ///
     /// # Parameters
-    /// * `device_info` - Dictionary containing updated device information
+    /// * `device_info` - VarDictionary containing updated device information
     #[signal]
-    fn device_updated(device_info: Dictionary);
+    fn device_updated(device_info: VarDictionary);
 
     /// Signal emitted when scanning starts
     #[signal]
@@ -325,13 +325,13 @@ impl BluetoothManager {
     /// Get information about the Bluetooth adapter
     ///
     /// # Returns
-    /// A Dictionary containing adapter information (name, address)
-    /// Returns an empty Dictionary if not initialized
+    /// A VarDictionary containing adapter information (name, address)
+    /// Returns an empty VarDictionary if not initialized
     #[func]
-    pub fn get_adapter_info(&self) -> Dictionary {
+    pub fn get_adapter_info(&self) -> VarDictionary {
         if !self.is_initialized() {
             godot_warn!("BluetoothManager: Adapter not initialized");
-            return Dictionary::new();
+            return VarDictionary::new();
         }
 
         if let Some(ref _adapter) = self.adapter {
@@ -342,7 +342,7 @@ impl BluetoothManager {
             );
             info.to_dictionary()
         } else {
-            Dictionary::new()
+            VarDictionary::new()
         }
     }
 
@@ -468,9 +468,9 @@ impl BluetoothManager {
     /// Get all discovered devices from the last scan
     ///
     /// # Returns
-    /// An Array of Dictionaries, each containing device information
+    /// An Array of VarDictionaries, each containing device information
     #[func]
-    pub fn get_discovered_devices(&self) -> Array<Dictionary> {
+    pub fn get_discovered_devices(&self) -> Array<VarDictionary> {
         if !self.is_initialized() {
             godot_warn!("BluetoothManager: Adapter not initialized");
             return Array::new();

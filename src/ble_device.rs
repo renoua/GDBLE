@@ -63,7 +63,7 @@ impl BleDevice {
     /// # Parameters
     /// * services: Array - Array of service dictionaries
     #[signal]
-    fn services_discovered(services: Array<Dictionary>);
+    fn services_discovered(services: Array<VarDictionary>);
 
     /// Signal emitted when a characteristic is read
     ///
@@ -308,7 +308,7 @@ impl BleDevice {
                     *services_cache.lock().unwrap() = service_infos.clone();
 
                     // Convert to array of dictionaries
-                    let services_array: Array<Dictionary> =
+                    let services_array: Array<VarDictionary> =
                         service_infos.iter().map(|s| s.to_dictionary()).collect();
 
                     // Emit signal using deferred call
@@ -350,7 +350,7 @@ impl BleDevice {
     /// # Returns
     /// Array of service dictionaries
     #[func]
-    fn get_services(&self) -> Array<Dictionary> {
+    fn get_services(&self) -> Array<VarDictionary> {
         let services = self.services.lock().unwrap();
         services.iter().map(|s| s.to_dictionary()).collect()
     }
@@ -643,7 +643,7 @@ impl BleDevice {
     }
 
     #[func]
-    fn _on_services_discovered(&mut self, services: Array<Dictionary>) {
+    fn _on_services_discovered(&mut self, services: Array<VarDictionary>) {
         self.base_mut()
             .emit_signal("services_discovered", &[services.to_variant()]);
     }

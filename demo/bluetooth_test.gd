@@ -25,7 +25,7 @@ func _ready():
 	# 初始化蓝牙适配器
 	print("Initializing Bluetooth adapter...")
 	# 关闭调试模式以减少输出
-	bluetooth_manager.set_debug_mode(false)
+	bluetooth_manager.set_debug_mode(true)
 	bluetooth_manager.initialize()
 	#start_scanning()
 
