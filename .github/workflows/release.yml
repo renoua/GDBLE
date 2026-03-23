@@ -385,6 +385,22 @@ jobs:
               - Added event processing in `BluetoothManager::process()`
               - Replaced all `godot_print!`/`godot_error!` with thread-safe `eprintln!` in logging macros
             
+            ### Multiple Devices Connection Fix
+            
+            Fixed panic when connecting multiple BLE devices simultaneously or when characteristic notification callbacks are triggered:
+            
+            - **Root Cause**: The error `Gd<T>::bind_mut() failed, already bound` occurred when multiple devices tried to emit signals at the same time, or when notification handlers from multiple devices fired callbacks concurrently.
+            
+            - **Solution**: 
+              - All Godot API calls are now deferred using `call_deferred()` to avoid borrow conflicts
+              - Events from all connected devices are collected in a single batch in `process()` method
+              - Each event is processed sequentially to prevent concurrent access to Godot objects
+            
+            - **Code Changes**:
+              - `emit_event_deferred()` uses `call_deferred()` for all signal emissions
+              - `collect_device_events()` batches all pending events before processing
+              - Events from different devices are processed in order, not concurrently
+            
             ## 📋 API Changes
             
             - `Dictionary` type replaced with `VarDictionary` (godot-rust 0.4.5 compatibility)
