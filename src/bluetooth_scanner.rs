@@ -1,4 +1,4 @@
-use btleplug::api::{Central, CentralEvent, ScanFilter};
+use btleplug::api::{Central, CentralEvent, ScanFilter, PeripheralProperties};
 use btleplug::platform::Adapter;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -219,57 +219,17 @@ impl BluetoothScanner {
             match event {
                 CentralEvent::DeviceDiscovered(id) => {
                     device_discovery_count += 1;
-                    // Get peripheral
                     if let Ok(peripheral) = self.adapter.peripheral(&id).await {
-                        // Get properties
                         if let Ok(Some(properties)) = peripheral.properties().await {
-                            // On macOS, use UUID as address since MAC address is not exposed
                             let address = id.to_string();
-                            let name = properties.local_name.clone();
-                            let rssi = properties.rssi;
-                            
-                            // Convert UUIDs to strings
-                            let services: Vec<String> = properties.services
-                                .iter()
-                                .map(|uuid| uuid.to_string())
-                                .collect();
-                                
-                            // Copy manufacturer data
-                            let manufacturer_data = properties.manufacturer_data.clone();
+                            let device_info = Self::create_device_info(address.clone(), properties);
 
-                            // Convert Service Data (UUID -> Vec<u8>) to (String -> Vec<u8>)
-                            let service_data: std::collections::HashMap<String, Vec<u8>> = properties.service_data
-                                .iter()
-                                .map(|(k, v)| (k.to_string(), v.clone()))
-                                .collect();
-
-                            let tx_power_level = properties.tx_power_level;
-
-                            // ble_info!(
-                            //     "Discovered device: {} ({}), RSSI: {:?}",
-                            //     name.as_ref().unwrap_or(&"Unknown".to_string()),
-                            //     address,
-                            //     rssi
-                            // );
-
-                            let device_info = DeviceInfo::new(
-                                address.clone(), 
-                                name, 
-                                rssi,
-                                services,
-                                manufacturer_data,
-                                service_data,
-                                tx_power_level
-                            );
-
-                            // Store device
                             if let Ok(mut devices) = self.discovered_devices.lock() {
                                 devices.insert(address.clone(), device_info.clone());
                             } else {
                                 ble_error!("Failed to acquire device map lock");
                             }
 
-                            // Send device info immediately through channel
                             if device_tx.send(device_info).is_err() {
                                 ble_warn!("Failed to send device info through channel");
                             }
@@ -281,52 +241,19 @@ impl BluetoothScanner {
                     }
                 }
                 CentralEvent::DeviceUpdated(id) => {
-                    // Get peripheral
                     if let Ok(peripheral) = self.adapter.peripheral(&id).await {
-                        // Get properties
                         if let Ok(Some(properties)) = peripheral.properties().await {
-                            // On macOS, use UUID as address since MAC address is not exposed
                             let address = id.to_string();
-                            let name = properties.local_name.clone();
-                            let rssi = properties.rssi;
-
-                            // Convert UUIDs to strings
-                            let services: Vec<String> = properties.services
-                                .iter()
-                                .map(|uuid| uuid.to_string())
-                                .collect();
-                                
-                            // Copy manufacturer data
-                            let manufacturer_data = properties.manufacturer_data.clone();
-
-                            // Convert Service Data (UUID -> Vec<u8>) to (String -> Vec<u8>)
-                            let service_data: std::collections::HashMap<String, Vec<u8>> = properties.service_data
-                                .iter()
-                                .map(|(k, v)| (k.to_string(), v.clone()))
-                                .collect();
-
-                            let tx_power_level = properties.tx_power_level;
+                            let device_info = Self::create_device_info(address.clone(), properties);
 
                             ble_debug!(
                                 "Updated device: {} ({}), RSSI: {:?}",
-                                name.as_ref().unwrap_or(&"Unknown".to_string()),
+                                device_info.name.as_ref().unwrap_or(&"Unknown".to_string()),
                                 address,
-                                rssi
+                                device_info.rssi
                             );
 
-                            let device_info = DeviceInfo::new(
-                                address.clone(), 
-                                name, 
-                                rssi,
-                                services,
-                                manufacturer_data,
-                                service_data,
-                                tx_power_level
-                            );
-
-                            // Update device
                             let should_send = if let Ok(mut devices) = self.discovered_devices.lock() {
-                                // Only send update if device already exists (to avoid duplicates)
                                 let exists = devices.contains_key(&address);
                                 devices.insert(address.clone(), device_info.clone());
                                 exists
@@ -335,7 +262,6 @@ impl BluetoothScanner {
                                 false
                             };
 
-                            // Send device update through channel if it's an existing device
                             if should_send {
                                 if device_tx.send(device_info).is_err() {
                                     ble_warn!("Failed to send device update through channel");
@@ -379,5 +305,30 @@ impl BluetoothScanner {
         } else {
             false
         }
+    }
+
+    fn create_device_info(address: String, properties: PeripheralProperties) -> DeviceInfo {
+        let name = properties.local_name;
+        let rssi = properties.rssi;
+        let services: Vec<String> = properties.services
+            .iter()
+            .map(|uuid| uuid.to_string())
+            .collect();
+        let manufacturer_data = properties.manufacturer_data;
+        let service_data: std::collections::HashMap<String, Vec<u8>> = properties.service_data
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        let tx_power_level = properties.tx_power_level;
+
+        DeviceInfo::new(
+            address,
+            name,
+            rssi,
+            services,
+            manufacturer_data,
+            service_data,
+            tx_power_level,
+        )
     }
 }

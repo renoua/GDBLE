@@ -12,6 +12,13 @@ use crate::ble_service::BleServiceInfo;
 use crate::types::{BleDeviceEvent, BleError};
 use crate::{ble_debug, ble_info, ble_warn, ble_error};
 
+enum CharEventKind {
+    Read,
+    Write,
+    Subscribe,
+    Unsubscribe,
+}
+
 /// BleDevice represents a single BLE peripheral device
 ///
 /// This class wraps a btleplug Peripheral and provides Godot-friendly
@@ -338,53 +345,35 @@ impl BleDevice {
                             );
                             ble_debug!("Read data: {:?}", data);
 
-                            if let Some(tx) = event_tx {
-                                let event = BleDeviceEvent::CharacteristicRead {
-                                    device_address: address,
-                                    char_uuid: char_uuid_for_async,
-                                    data,
-                                };
-                                if let Ok(tx_guard) = tx.lock() {
-                                    let _ = tx_guard.send(event);
-                                }
-                            }
+                            let event = BleDeviceEvent::CharacteristicRead {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                data,
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                         Err(e) => {
                             let error = BleError::ReadFailed(e.to_string());
                             error.log_error();
 
-                            if let Some(tx) = event_tx {
-                                let event = BleDeviceEvent::CharacteristicReadFailed {
-                                    device_address: address,
-                                    char_uuid: char_uuid_for_async,
-                                    error: error.to_string(),
-                                };
-                                if let Ok(tx_guard) = tx.lock() {
-                                    let _ = tx_guard.send(event);
-                                }
-                            }
+                            let event = BleDeviceEvent::CharacteristicReadFailed {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                error: error.to_string(),
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                     }
                 });
             }
             None => {
-                let error = BleError::CharacteristicNotFound(format!(
-                    "{} in service {}",
-                    char_uuid_str, service_uuid_str
-                ));
-                error.log_error();
-
-                let address = self.address.to_string();
-                if let Some(tx) = self.event_tx.clone() {
-                    let event = BleDeviceEvent::CharacteristicReadFailed {
-                        device_address: address,
-                        char_uuid: char_uuid_str,
-                        error: error.to_string(),
-                    };
-                    if let Ok(tx_guard) = tx.lock() {
-                        let _ = tx_guard.send(event);
-                    }
-                }
+                Self::send_char_not_found_event(
+                    &self.event_tx,
+                    self.address.to_string(),
+                    char_uuid_str,
+                    &service_uuid_str,
+                    CharEventKind::Read,
+                );
             }
         }
     }
@@ -454,52 +443,34 @@ impl BleDevice {
                                 char_uuid_for_async
                             );
 
-                            if let Some(tx) = event_tx {
-                                let event = BleDeviceEvent::CharacteristicWritten {
-                                    device_address: address,
-                                    char_uuid: char_uuid_for_async,
-                                };
-                                if let Ok(tx_guard) = tx.lock() {
-                                    let _ = tx_guard.send(event);
-                                }
-                            }
+                            let event = BleDeviceEvent::CharacteristicWritten {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                         Err(e) => {
                             let error = BleError::WriteFailed(e.to_string());
                             error.log_error();
 
-                            if let Some(tx) = event_tx {
-                                let event = BleDeviceEvent::CharacteristicWriteFailed {
-                                    device_address: address,
-                                    char_uuid: char_uuid_for_async,
-                                    error: error.to_string(),
-                                };
-                                if let Ok(tx_guard) = tx.lock() {
-                                    let _ = tx_guard.send(event);
-                                }
-                            }
+                            let event = BleDeviceEvent::CharacteristicWriteFailed {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                error: error.to_string(),
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                     }
                 });
             }
             None => {
-                let error = BleError::CharacteristicNotFound(format!(
-                    "{} in service {}",
-                    char_uuid_str, service_uuid_str
-                ));
-                error.log_error();
-
-                let address = self.address.to_string();
-                if let Some(tx) = self.event_tx.clone() {
-                    let event = BleDeviceEvent::CharacteristicWriteFailed {
-                        device_address: address,
-                        char_uuid: char_uuid_str,
-                        error: error.to_string(),
-                    };
-                    if let Ok(tx_guard) = tx.lock() {
-                        let _ = tx_guard.send(event);
-                    }
-                }
+                Self::send_char_not_found_event(
+                    &self.event_tx,
+                    self.address.to_string(),
+                    char_uuid_str,
+                    &service_uuid_str,
+                    CharEventKind::Write,
+                );
             }
         }
     }
@@ -529,6 +500,11 @@ impl BleDevice {
         let char_uuid_str = char_uuid.to_string();
         let char_uuid_lower = char_uuid_str.to_lowercase();
 
+        if self.subscribed_characteristics.lock().unwrap().contains(&char_uuid_lower) {
+            ble_warn!("Already subscribed to characteristic {}, ignoring", char_uuid_str);
+            return;
+        }
+
         match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, subscribing", char_uuid_str);
@@ -552,15 +528,11 @@ impl BleDevice {
                                 .unwrap()
                                 .insert(char_uuid_lower.clone());
 
-                            if let Some(tx) = event_tx.clone() {
-                                let event = BleDeviceEvent::SubscribeSuccess {
-                                    device_address: address.clone(),
-                                    char_uuid: char_uuid_for_async.clone(),
-                                };
-                                if let Ok(tx_guard) = tx.lock() {
-                                    let _ = tx_guard.send(event);
-                                }
-                            }
+                            let event = BleDeviceEvent::SubscribeSuccess {
+                                device_address: address.clone(),
+                                char_uuid: char_uuid_for_async.clone(),
+                            };
+                            Self::send_event_via(&event_tx, event);
 
                             let peripheral_clone = peripheral.clone();
                             let char_uuid_for_handler = char_uuid_for_async.clone();
@@ -586,16 +558,12 @@ impl BleDevice {
                                                 notification.value.len()
                                             );
 
-                                            if let Some(tx) = event_tx_for_handler.clone() {
-                                                let event = BleDeviceEvent::CharacteristicNotified {
-                                                    device_address: address_for_handler.clone(),
-                                                    char_uuid: char_uuid_for_handler.clone(),
-                                                    data: notification.value,
-                                                };
-                                                if let Ok(tx_guard) = tx.lock() {
-                                                    let _ = tx_guard.send(event);
-                                                }
-                                            }
+                                            let event = BleDeviceEvent::CharacteristicNotified {
+                                                device_address: address_for_handler.clone(),
+                                                char_uuid: char_uuid_for_handler.clone(),
+                                                data: notification.value,
+                                            };
+                                            Self::send_event_via(&event_tx_for_handler, event);
                                         }
                                     }
                                     ble_debug!("Notification stream ended for {}", char_uuid_for_handler);
@@ -610,38 +578,24 @@ impl BleDevice {
                             let error = BleError::SubscribeFailed(e.to_string());
                             error.log_error();
 
-                            if let Some(tx) = event_tx {
-                                let event = BleDeviceEvent::SubscribeFailed {
-                                    device_address: address,
-                                    char_uuid: char_uuid_for_async,
-                                    error: error.to_string(),
-                                };
-                                if let Ok(tx_guard) = tx.lock() {
-                                    let _ = tx_guard.send(event);
-                                }
-                            }
+                            let event = BleDeviceEvent::SubscribeFailed {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                error: error.to_string(),
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                     }
                 });
             }
             None => {
-                let error = BleError::CharacteristicNotFound(format!(
-                    "{} in service {}",
-                    char_uuid_str, service_uuid_str
-                ));
-                error.log_error();
-
-                let address = self.address.to_string();
-                if let Some(tx) = self.event_tx.clone() {
-                    let event = BleDeviceEvent::SubscribeFailed {
-                        device_address: address,
-                        char_uuid: char_uuid_str,
-                        error: error.to_string(),
-                    };
-                    if let Ok(tx_guard) = tx.lock() {
-                        let _ = tx_guard.send(event);
-                    }
-                }
+                Self::send_char_not_found_event(
+                    &self.event_tx,
+                    self.address.to_string(),
+                    char_uuid_str,
+                    &service_uuid_str,
+                    CharEventKind::Subscribe,
+                );
             }
         }
     }
@@ -704,52 +658,34 @@ impl BleDevice {
                                 char_uuid_for_async
                             );
 
-                            if let Some(tx) = event_tx {
-                                let event = BleDeviceEvent::UnsubscribeSuccess {
-                                    device_address: address,
-                                    char_uuid: char_uuid_for_async,
-                                };
-                                if let Ok(tx_guard) = tx.lock() {
-                                    let _ = tx_guard.send(event);
-                                }
-                            }
+                            let event = BleDeviceEvent::UnsubscribeSuccess {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                         Err(e) => {
                             let error = BleError::UnsubscribeFailed(e.to_string());
                             error.log_error();
 
-                            if let Some(tx) = event_tx {
-                                let event = BleDeviceEvent::UnsubscribeFailed {
-                                    device_address: address,
-                                    char_uuid: char_uuid_for_async,
-                                    error: error.to_string(),
-                                };
-                                if let Ok(tx_guard) = tx.lock() {
-                                    let _ = tx_guard.send(event);
-                                }
-                            }
+                            let event = BleDeviceEvent::UnsubscribeFailed {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                error: error.to_string(),
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                     }
                 });
             }
             None => {
-                let error = BleError::CharacteristicNotFound(format!(
-                    "{} in service {}",
-                    char_uuid_str, service_uuid_str
-                ));
-                error.log_error();
-
-                let address = self.address.to_string();
-                if let Some(tx) = self.event_tx.clone() {
-                    let event = BleDeviceEvent::UnsubscribeFailed {
-                        device_address: address,
-                        char_uuid: char_uuid_str,
-                        error: error.to_string(),
-                    };
-                    if let Ok(tx_guard) = tx.lock() {
-                        let _ = tx_guard.send(event);
-                    }
-                }
+                Self::send_char_not_found_event(
+                    &self.event_tx,
+                    self.address.to_string(),
+                    char_uuid_str,
+                    &service_uuid_str,
+                    CharEventKind::Unsubscribe,
+                );
             }
         }
     }
@@ -820,6 +756,52 @@ impl BleDevice {
                 let _ = tx_guard.send(event);
             }
         }
+    }
+
+    fn send_event_via(tx: &Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>, event: BleDeviceEvent) {
+        if let Some(tx) = tx {
+            if let Ok(tx_guard) = tx.lock() {
+                let _ = tx_guard.send(event);
+            }
+        }
+    }
+
+    fn send_char_not_found_event(
+        tx: &Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>,
+        device_address: String,
+        char_uuid: String,
+        service_uuid: &str,
+        event_type: CharEventKind,
+    ) {
+        let error = BleError::CharacteristicNotFound(format!(
+            "{} in service {}",
+            char_uuid, service_uuid
+        ));
+        error.log_error();
+
+        let event = match event_type {
+            CharEventKind::Read => BleDeviceEvent::CharacteristicReadFailed {
+                device_address,
+                char_uuid,
+                error: error.to_string(),
+            },
+            CharEventKind::Write => BleDeviceEvent::CharacteristicWriteFailed {
+                device_address,
+                char_uuid,
+                error: error.to_string(),
+            },
+            CharEventKind::Subscribe => BleDeviceEvent::SubscribeFailed {
+                device_address,
+                char_uuid,
+                error: error.to_string(),
+            },
+            CharEventKind::Unsubscribe => BleDeviceEvent::UnsubscribeFailed {
+                device_address,
+                char_uuid,
+                error: error.to_string(),
+            },
+        };
+        Self::send_event_via(tx, event);
     }
 
     fn convert_characteristic(characteristic: &Characteristic) -> BleCharacteristicInfo {

@@ -304,8 +304,8 @@ impl BluetoothManager {
         match self.is_initialized.lock() {
             Ok(guard) => *guard,
             Err(_) => {
-                ble_error!("Failed to acquire initialization lock");
-                false
+                ble_error!("Failed to acquire initialization lock (lock poisoned)");
+                true
             }
         }
     }
