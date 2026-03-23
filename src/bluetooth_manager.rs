@@ -41,6 +41,9 @@ pub struct BluetoothManager {
     /// Channel receiver for device events (thread-safe communication)
     device_event_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<BleDeviceEvent>>>>,
 
+    /// Channel sender for device events (shared with all BleDevice instances)
+    device_event_tx: Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>,
+
     /// Map of connected devices by address
     devices: Arc<Mutex<HashMap<String, Gd<BleDevice>>>>,
 
@@ -61,6 +64,7 @@ impl INode for BluetoothManager {
             scan_complete_rx: None,
             device_rx: None,
             device_event_rx: None,
+            device_event_tx: None,
             devices: Arc::new(Mutex::new(HashMap::new())),
             is_initialized: Arc::new(Mutex::new(false)),
         }
@@ -228,21 +232,7 @@ impl BluetoothManager {
         ble_debug!("Checking initialization state");
 
         // Check if already initialized
-        let lock_failed = self.is_initialized.lock().is_err();
-        if lock_failed {
-            ble_error!("Failed to acquire initialization lock");
-            let error = BleError::InternalError("Lock acquisition failed".to_string());
-            error.log_error();
-            self.base_mut().emit_signal(
-                "adapter_initialized",
-                &[false.to_variant(), error.to_gstring().to_variant()],
-            );
-            return;
-        }
-        
-        let already_initialized = *self.is_initialized.lock().unwrap();
-
-        if already_initialized {
+        if self.check_already_initialized() {
             ble_warn!("Adapter already initialized, skipping initialization");
             self.base_mut().emit_signal(
                 "adapter_initialized",
@@ -280,13 +270,15 @@ impl BluetoothManager {
                     ble_debug!("Scanner created successfully");
                 }
 
+                // Create device event channel (shared across all devices)
+                let (event_tx, event_rx) = mpsc::unbounded_channel::<BleDeviceEvent>();
+                self.device_event_tx = Some(Arc::new(Mutex::new(event_tx)));
+                self.device_event_rx = Some(Arc::new(Mutex::new(event_rx)));
+                ble_debug!("Device event channel created");
+
                 // Mark as initialized
-                if let Ok(mut init) = self.is_initialized.lock() {
-                    *init = true;
-                    ble_info!("Bluetooth initialization complete");
-                } else {
-                    ble_error!("Failed to update initialization state");
-                }
+                self.set_initialized(true);
+                ble_info!("Bluetooth initialization complete");
 
                 self.base_mut().emit_signal(
                     "adapter_initialized",
@@ -305,6 +297,24 @@ impl BluetoothManager {
                     &[error_msg.to_variant()],
                 );
             }
+        }
+    }
+
+    fn check_already_initialized(&self) -> bool {
+        match self.is_initialized.lock() {
+            Ok(guard) => *guard,
+            Err(_) => {
+                ble_error!("Failed to acquire initialization lock");
+                false
+            }
+        }
+    }
+
+    fn set_initialized(&self, value: bool) {
+        if let Ok(mut guard) = self.is_initialized.lock() {
+            *guard = value;
+        } else {
+            ble_error!("Failed to update initialization state");
         }
     }
 
@@ -590,9 +600,18 @@ impl BluetoothManager {
 
         ble_debug!("Creating BleDevice instance for {}", address_str);
         
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<BleDeviceEvent>();
-        let event_tx = Arc::new(Mutex::new(event_tx));
-        self.device_event_rx = Some(Arc::new(Mutex::new(event_rx)));
+        let event_tx = match &self.device_event_tx {
+            Some(tx) => tx.clone(),
+            None => {
+                let error = BleError::InternalError("Event channel not initialized".to_string());
+                error.log_error();
+                self.base_mut().emit_signal(
+                    "error_occurred",
+                    &[error.to_gstring().to_variant()],
+                );
+                return None;
+            }
+        };
 
         let device = BleDevice::new(peripheral, runtime.clone(), event_tx);
 
@@ -702,6 +721,10 @@ impl BluetoothManager {
             }
             BleDeviceEvent::Disconnected { device_address } => {
                 ble_info!("Device {} disconnected", device_address);
+                if let Some(device) = self.get_device_by_address(&device_address) {
+                    let mut obj: Gd<Object> = device.upcast();
+                    obj.call_deferred("emit_signal", &["disconnected".to_variant()]);
+                }
                 {
                     let mut devices = self.devices.lock().unwrap();
                     devices.remove(&device_address);
@@ -859,21 +882,20 @@ impl BluetoothManager {
             }
         }
 
-        // Disconnect all devices
-        {
+        // Clone device list first to avoid holding lock while calling disconnect
+        let devices_to_disconnect: Vec<Gd<BleDevice>> = {
             let devices = self.devices.lock().unwrap();
-            let device_addresses: Vec<String> = devices.keys().cloned().collect();
-            
-            if !device_addresses.is_empty() {
-                ble_debug!("Disconnecting {} devices during cleanup", device_addresses.len());
+            if !devices.is_empty() {
+                ble_debug!("Disconnecting {} devices during cleanup", devices.len());
             }
-            
-            for address in device_addresses {
-                ble_debug!("Disconnecting device: {}", address);
-                if let Some(mut device) = devices.get(&address).cloned() {
-                    device.call("disconnect", &[]);
-                }
-            }
+            devices.values().cloned().collect()
+        };
+
+        // Disconnect devices without holding the lock
+        for device in devices_to_disconnect {
+            let mut device = device;
+            ble_debug!("Disconnecting device");
+            device.call("disconnect", &[]);
         }
 
         // Clear devices map

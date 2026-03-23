@@ -1,10 +1,11 @@
 use btleplug::api::{CharPropFlags, Characteristic, Peripheral as _, WriteType};
 use btleplug::platform::Peripheral;
 use godot::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::ble_characteristic::{BleCharacteristicInfo, CharacteristicProperties};
 use crate::ble_service::BleServiceInfo;
@@ -40,6 +41,9 @@ pub struct BleDevice {
 
     /// Set of subscribed characteristic UUIDs (stored as lowercase strings)
     subscribed_characteristics: Arc<Mutex<HashSet<String>>>,
+
+    /// Notification task handles by characteristic UUID (for cleanup)
+    notification_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
 
     /// Event sender for thread-safe communication with BluetoothManager
     event_tx: Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>,
@@ -124,6 +128,18 @@ impl BleDevice {
         let address = self.address.to_string();
         ble_debug!("Initiating disconnect for device: {}", address);
 
+        // Abort all notification tasks
+        let notification_tasks = self.notification_tasks.lock().unwrap();
+        let task_count = notification_tasks.len();
+        if task_count > 0 {
+            ble_debug!("Aborting {} notification tasks", task_count);
+            for (_, handle) in notification_tasks.iter() {
+                handle.abort();
+            }
+        }
+        drop(notification_tasks);
+        self.notification_tasks.lock().unwrap().clear();
+
         let peripheral = self.peripheral.clone();
         let runtime = self.runtime.clone();
         let is_connected = self.is_connected.clone();
@@ -157,8 +173,6 @@ impl BleDevice {
                 }
             }
         });
-
-        self.base_mut().emit_signal("disconnected", &[]);
     }
 
     /// Check if the device is currently connected
@@ -287,8 +301,7 @@ impl BleDevice {
             service_uuid
         );
 
-        if !*self.is_connected.lock().unwrap() {
-            let error = BleError::NotConnected;
+        if let Err(error) = self.check_connected() {
             error.log_error();
             self.base_mut().emit_signal(
                 "operation_failed",
@@ -300,42 +313,35 @@ impl BleDevice {
             return;
         }
 
-        let peripheral = self.peripheral.clone();
-        let runtime = self.runtime.clone();
         let service_uuid_str = service_uuid.to_string();
         let char_uuid_str = char_uuid.to_string();
-        let address = self.address.to_string();
-        let event_tx = self.event_tx.clone();
 
-        let characteristics = peripheral.characteristics();
-        let characteristic = characteristics.iter().find(|c| {
-            c.uuid.to_string().eq_ignore_ascii_case(&char_uuid_str)
-                && c.service_uuid
-                    .to_string()
-                    .eq_ignore_ascii_case(&service_uuid_str)
-        });
-
-        match characteristic {
+        match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, reading value", char_uuid_str);
-                let char_clone = char.clone();
+                
+                let peripheral = self.peripheral.clone();
+                let runtime = self.runtime.clone();
+                let address = self.address.to_string();
+                let char_uuid_for_async = char_uuid_str.clone();
+                let event_tx = self.event_tx.clone();
                 
                 runtime.spawn(async move {
-                    let result = peripheral.read(&char_clone).await;
+                    let result = peripheral.read(&char).await;
 
                     match result {
                         Ok(data) => {
                             ble_info!(
                                 "Successfully read {} bytes from characteristic {}",
                                 data.len(),
-                                char_uuid_str
+                                char_uuid_for_async
                             );
                             ble_debug!("Read data: {:?}", data);
 
                             if let Some(tx) = event_tx {
                                 let event = BleDeviceEvent::CharacteristicRead {
                                     device_address: address,
-                                    char_uuid: char_uuid_str,
+                                    char_uuid: char_uuid_for_async,
                                     data,
                                 };
                                 if let Ok(tx_guard) = tx.lock() {
@@ -350,7 +356,7 @@ impl BleDevice {
                             if let Some(tx) = event_tx {
                                 let event = BleDeviceEvent::CharacteristicReadFailed {
                                     device_address: address,
-                                    char_uuid: char_uuid_str,
+                                    char_uuid: char_uuid_for_async,
                                     error: error.to_string(),
                                 };
                                 if let Ok(tx_guard) = tx.lock() {
@@ -368,7 +374,8 @@ impl BleDevice {
                 ));
                 error.log_error();
 
-                if let Some(tx) = event_tx {
+                let address = self.address.to_string();
+                if let Some(tx) = self.event_tx.clone() {
                     let event = BleDeviceEvent::CharacteristicReadFailed {
                         device_address: address,
                         char_uuid: char_uuid_str,
@@ -400,8 +407,7 @@ impl BleDevice {
             service_uuid
         );
 
-        if !*self.is_connected.lock().unwrap() {
-            let error = BleError::NotConnected;
+        if let Err(error) = self.check_connected() {
             error.log_error();
             self.base_mut().emit_signal(
                 "operation_failed",
@@ -413,38 +419,30 @@ impl BleDevice {
             return;
         }
 
-        let peripheral = self.peripheral.clone();
-        let runtime = self.runtime.clone();
         let service_uuid_str = service_uuid.to_string();
         let char_uuid_str = char_uuid.to_string();
-        let address = self.address.to_string();
-        let event_tx = self.event_tx.clone();
 
-        let data_vec: Vec<u8> = data.to_vec();
-        let data_len = data_vec.len();
-
-        let characteristics = peripheral.characteristics();
-        let characteristic = characteristics.iter().find(|c| {
-            c.uuid.to_string().eq_ignore_ascii_case(&char_uuid_str)
-                && c.service_uuid
-                    .to_string()
-                    .eq_ignore_ascii_case(&service_uuid_str)
-        });
-
-        match characteristic {
+        match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, writing data", char_uuid_str);
-                ble_debug!("Write data: {:?}", data_vec);
-                let char_clone = char.clone();
+                ble_debug!("Write data: {:?}", data.to_vec());
+
+                let peripheral = self.peripheral.clone();
+                let runtime = self.runtime.clone();
+                let address = self.address.to_string();
+                let char_uuid_for_async = char_uuid_str.clone();
+                let event_tx = self.event_tx.clone();
+                let data_vec: Vec<u8> = data.to_vec();
+                let data_len = data_vec.len();
 
                 runtime.spawn(async move {
                     let result = if with_response {
                         peripheral
-                            .write(&char_clone, &data_vec, WriteType::WithResponse)
+                            .write(&char, &data_vec, WriteType::WithResponse)
                             .await
                     } else {
                         peripheral
-                            .write(&char_clone, &data_vec, WriteType::WithoutResponse)
+                            .write(&char, &data_vec, WriteType::WithoutResponse)
                             .await
                     };
 
@@ -453,13 +451,13 @@ impl BleDevice {
                             ble_info!(
                                 "Successfully wrote {} bytes to characteristic {}",
                                 data_len,
-                                char_uuid_str
+                                char_uuid_for_async
                             );
 
                             if let Some(tx) = event_tx {
                                 let event = BleDeviceEvent::CharacteristicWritten {
                                     device_address: address,
-                                    char_uuid: char_uuid_str,
+                                    char_uuid: char_uuid_for_async,
                                 };
                                 if let Ok(tx_guard) = tx.lock() {
                                     let _ = tx_guard.send(event);
@@ -473,7 +471,7 @@ impl BleDevice {
                             if let Some(tx) = event_tx {
                                 let event = BleDeviceEvent::CharacteristicWriteFailed {
                                     device_address: address,
-                                    char_uuid: char_uuid_str,
+                                    char_uuid: char_uuid_for_async,
                                     error: error.to_string(),
                                 };
                                 if let Ok(tx_guard) = tx.lock() {
@@ -491,7 +489,8 @@ impl BleDevice {
                 ));
                 error.log_error();
 
-                if let Some(tx) = event_tx {
+                let address = self.address.to_string();
+                if let Some(tx) = self.event_tx.clone() {
                     let event = BleDeviceEvent::CharacteristicWriteFailed {
                         device_address: address,
                         char_uuid: char_uuid_str,
@@ -514,8 +513,7 @@ impl BleDevice {
             service_uuid
         );
 
-        if !*self.is_connected.lock().unwrap() {
-            let error = BleError::NotConnected;
+        if let Err(error) = self.check_connected() {
             error.log_error();
             self.base_mut().emit_signal(
                 "operation_failed",
@@ -527,41 +525,37 @@ impl BleDevice {
             return;
         }
 
-        let peripheral = self.peripheral.clone();
-        let runtime = self.runtime.clone();
         let service_uuid_str = service_uuid.to_string();
         let char_uuid_str = char_uuid.to_string();
-        let address = self.address.to_string();
-        let event_tx = self.event_tx.clone();
-        let subscribed_chars = self.subscribed_characteristics.clone();
+        let char_uuid_lower = char_uuid_str.to_lowercase();
 
-        let characteristics = peripheral.characteristics();
-        let characteristic = characteristics.iter().find(|c| {
-            c.uuid.to_string().eq_ignore_ascii_case(&char_uuid_str)
-                && c.service_uuid
-                    .to_string()
-                    .eq_ignore_ascii_case(&service_uuid_str)
-        });
-
-        match characteristic {
+        match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, subscribing", char_uuid_str);
-                let char_clone = char.clone();
+                
+                let peripheral = self.peripheral.clone();
+                let runtime = self.runtime.clone();
+                let address = self.address.to_string();
+                let char_uuid_for_async = char_uuid_str.clone();
+                let char_uuid_lower_for_task = char_uuid_lower.clone();
+                let event_tx = self.event_tx.clone();
+                let subscribed_chars = self.subscribed_characteristics.clone();
+                let notification_tasks = self.notification_tasks.clone();
                 
                 runtime.spawn(async move {
-                    let result = peripheral.subscribe(&char_clone).await;
+                    let result = peripheral.subscribe(&char).await;
 
                     match result {
                         Ok(_) => {
                             subscribed_chars
                                 .lock()
                                 .unwrap()
-                                .insert(char_uuid_str.to_lowercase());
+                                .insert(char_uuid_lower.clone());
 
                             if let Some(tx) = event_tx.clone() {
                                 let event = BleDeviceEvent::SubscribeSuccess {
                                     device_address: address.clone(),
-                                    char_uuid: char_uuid_str.clone(),
+                                    char_uuid: char_uuid_for_async.clone(),
                                 };
                                 if let Ok(tx_guard) = tx.lock() {
                                     let _ = tx_guard.send(event);
@@ -569,11 +563,12 @@ impl BleDevice {
                             }
 
                             let peripheral_clone = peripheral.clone();
-                            let char_uuid_for_handler = char_uuid_str.clone();
+                            let char_uuid_for_handler = char_uuid_for_async.clone();
                             let event_tx_for_handler = event_tx.clone();
                             let address_for_handler = address.clone();
+                            let char_uuid_lower_for_insert = char_uuid_lower_for_task.clone();
 
-                            tokio::spawn(async move {
+                            let handle = tokio::spawn(async move {
                                 ble_debug!("Starting notification handler for {}", char_uuid_for_handler);
                                 let mut notification_stream = peripheral_clone.notifications().await;
 
@@ -608,6 +603,8 @@ impl BleDevice {
                                     ble_error!("Failed to get notification stream for {}", char_uuid_for_handler);
                                 }
                             });
+
+                            notification_tasks.lock().unwrap().insert(char_uuid_lower_for_insert, handle);
                         }
                         Err(e) => {
                             let error = BleError::SubscribeFailed(e.to_string());
@@ -616,7 +613,7 @@ impl BleDevice {
                             if let Some(tx) = event_tx {
                                 let event = BleDeviceEvent::SubscribeFailed {
                                     device_address: address,
-                                    char_uuid: char_uuid_str,
+                                    char_uuid: char_uuid_for_async,
                                     error: error.to_string(),
                                 };
                                 if let Ok(tx_guard) = tx.lock() {
@@ -634,7 +631,8 @@ impl BleDevice {
                 ));
                 error.log_error();
 
-                if let Some(tx) = event_tx {
+                let address = self.address.to_string();
+                if let Some(tx) = self.event_tx.clone() {
                     let event = BleDeviceEvent::SubscribeFailed {
                         device_address: address,
                         char_uuid: char_uuid_str,
@@ -657,8 +655,7 @@ impl BleDevice {
             service_uuid
         );
 
-        if !*self.is_connected.lock().unwrap() {
-            let error = BleError::NotConnected;
+        if let Err(error) = self.check_connected() {
             error.log_error();
             self.base_mut().emit_signal(
                 "operation_failed",
@@ -670,46 +667,47 @@ impl BleDevice {
             return;
         }
 
-        let peripheral = self.peripheral.clone();
-        let runtime = self.runtime.clone();
+        // Abort notification task first
+        let char_uuid_lower = char_uuid.to_string().to_lowercase();
+        if let Some(handle) = self.notification_tasks.lock().unwrap().remove(&char_uuid_lower) {
+            handle.abort();
+            ble_debug!("Aborted notification task for {}", char_uuid_lower);
+        }
+
         let service_uuid_str = service_uuid.to_string();
         let char_uuid_str = char_uuid.to_string();
-        let address = self.address.to_string();
-        let event_tx = self.event_tx.clone();
-        let subscribed_chars = self.subscribed_characteristics.clone();
 
-        let characteristics = peripheral.characteristics();
-        let characteristic = characteristics.iter().find(|c| {
-            c.uuid.to_string().eq_ignore_ascii_case(&char_uuid_str)
-                && c.service_uuid
-                    .to_string()
-                    .eq_ignore_ascii_case(&service_uuid_str)
-        });
-
-        match characteristic {
+        match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, unsubscribing", char_uuid_str);
-                let char_clone = char.clone();
+                
+                let peripheral = self.peripheral.clone();
+                let runtime = self.runtime.clone();
+                let address = self.address.to_string();
+                let char_uuid_for_async = char_uuid_str.clone();
+                let char_uuid_lower_for_remove = char_uuid_lower.clone();
+                let event_tx = self.event_tx.clone();
+                let subscribed_chars = self.subscribed_characteristics.clone();
                 
                 runtime.spawn(async move {
-                    let result = peripheral.unsubscribe(&char_clone).await;
+                    let result = peripheral.unsubscribe(&char).await;
 
                     match result {
                         Ok(_) => {
                             subscribed_chars
                                 .lock()
                                 .unwrap()
-                                .remove(&char_uuid_str.to_lowercase());
+                                .remove(&char_uuid_lower_for_remove);
 
                             ble_info!(
                                 "Successfully unsubscribed from characteristic {}",
-                                char_uuid_str
+                                char_uuid_for_async
                             );
 
                             if let Some(tx) = event_tx {
                                 let event = BleDeviceEvent::UnsubscribeSuccess {
                                     device_address: address,
-                                    char_uuid: char_uuid_str,
+                                    char_uuid: char_uuid_for_async,
                                 };
                                 if let Ok(tx_guard) = tx.lock() {
                                     let _ = tx_guard.send(event);
@@ -723,7 +721,7 @@ impl BleDevice {
                             if let Some(tx) = event_tx {
                                 let event = BleDeviceEvent::UnsubscribeFailed {
                                     device_address: address,
-                                    char_uuid: char_uuid_str,
+                                    char_uuid: char_uuid_for_async,
                                     error: error.to_string(),
                                 };
                                 if let Ok(tx_guard) = tx.lock() {
@@ -741,7 +739,8 @@ impl BleDevice {
                 ));
                 error.log_error();
 
-                if let Some(tx) = event_tx {
+                let address = self.address.to_string();
+                if let Some(tx) = self.event_tx.clone() {
                     let event = BleDeviceEvent::UnsubscribeFailed {
                         device_address: address,
                         char_uuid: char_uuid_str,
@@ -794,8 +793,33 @@ impl BleDevice {
             is_connected: Arc::new(Mutex::new(false)),
             services: Arc::new(Mutex::new(Vec::new())),
             subscribed_characteristics: Arc::new(Mutex::new(HashSet::new())),
+            notification_tasks: Arc::new(Mutex::new(HashMap::new())),
             event_tx: Some(event_tx),
         })
+    }
+
+    fn check_connected(&self) -> Result<(), BleError> {
+        if *self.is_connected.lock().unwrap() {
+            Ok(())
+        } else {
+            Err(BleError::NotConnected)
+        }
+    }
+
+    fn find_characteristic(&self, service_uuid: &str, char_uuid: &str) -> Option<Characteristic> {
+        let characteristics = self.peripheral.characteristics();
+        characteristics.iter().find(|c| {
+            c.uuid.to_string().eq_ignore_ascii_case(char_uuid)
+                && c.service_uuid.to_string().eq_ignore_ascii_case(service_uuid)
+        }).cloned()
+    }
+
+    fn send_event(&self, event: BleDeviceEvent) {
+        if let Some(ref tx) = self.event_tx {
+            if let Ok(tx_guard) = tx.lock() {
+                let _ = tx_guard.send(event);
+            }
+        }
     }
 
     fn convert_characteristic(characteristic: &Characteristic) -> BleCharacteristicInfo {
@@ -814,6 +838,19 @@ impl BleDevice {
     fn cleanup(&mut self) {
         let address = self.address.to_string();
         ble_debug!("Starting cleanup for device: {}", address);
+
+        // Abort all notification tasks
+        let notification_tasks = self.notification_tasks.lock().unwrap();
+        let task_count = notification_tasks.len();
+        if task_count > 0 {
+            ble_debug!("Aborting {} notification tasks", task_count);
+            for (char_uuid, handle) in notification_tasks.iter() {
+                handle.abort();
+                ble_debug!("Aborted notification task for {}", char_uuid);
+            }
+        }
+        drop(notification_tasks);
+        self.notification_tasks.lock().unwrap().clear();
 
         let is_connected = *self.is_connected.lock().unwrap();
         
