@@ -750,14 +750,6 @@ impl BleDevice {
         }).cloned()
     }
 
-    fn send_event(&self, event: BleDeviceEvent) {
-        if let Some(ref tx) = self.event_tx {
-            if let Ok(tx_guard) = tx.lock() {
-                let _ = tx_guard.send(event);
-            }
-        }
-    }
-
     fn send_event_via(tx: &Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>, event: BleDeviceEvent) {
         if let Some(tx) = tx {
             if let Ok(tx_guard) = tx.lock() {

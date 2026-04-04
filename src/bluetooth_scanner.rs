@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::types::{BleError, DeviceInfo};
-use crate::{ble_debug, ble_info, ble_error, ble_warn};
+use crate::{ble_debug, ble_error, ble_warn};
 
 /// BluetoothScanner handles BLE device scanning operations
 /// 
@@ -201,7 +201,6 @@ impl BluetoothScanner {
 
         // Process events with a counter to avoid infinite loops
         let mut event_count = 0;
-        let mut device_discovery_count = 0;
         let max_events = 1000; // Safety limit to prevent infinite loops
         
         while let Some(event) = events.next().await {
@@ -218,7 +217,6 @@ impl BluetoothScanner {
             
             match event {
                 CentralEvent::DeviceDiscovered(id) => {
-                    device_discovery_count += 1;
                     if let Ok(peripheral) = self.adapter.peripheral(&id).await {
                         if let Ok(Some(properties)) = peripheral.properties().await {
                             let address = id.to_string();
