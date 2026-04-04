@@ -38,6 +38,9 @@ pub struct BluetoothManager {
     /// Channel receiver for discovered devices (real-time)
     device_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<DeviceInfo>>>>,
 
+    /// Whether scan_stopped has been emitted for current scan cycle
+    scan_stopped_emitted: bool,
+
     /// Channel receiver for device events (thread-safe communication)
     device_event_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<BleDeviceEvent>>>>,
 
@@ -63,6 +66,7 @@ impl INode for BluetoothManager {
             scanner: None,
             scan_complete_rx: None,
             device_rx: None,
+            scan_stopped_emitted: false,
             device_event_rx: None,
             device_event_tx: None,
             devices: Arc::new(Mutex::new(HashMap::new())),
@@ -109,14 +113,14 @@ impl INode for BluetoothManager {
 
             match result {
                 Ok(()) => {
-                    self.base_mut().emit_signal("scan_stopped", &[]);
+                    self.emit_scan_stopped_once();
                 }
                 Err(error_msg) => {
                     self.base_mut().emit_signal(
                         "error_occurred",
                         &[GString::from(error_msg.as_str()).to_variant()],
                     );
-                    self.base_mut().emit_signal("scan_stopped", &[]);
+                    self.emit_scan_stopped_once();
                 }
             }
         }
@@ -138,6 +142,21 @@ impl INode for BluetoothManager {
 
 #[godot_api]
 impl BluetoothManager {
+    fn should_emit_scan_stopped(emitted: &mut bool) -> bool {
+        if *emitted {
+            false
+        } else {
+            *emitted = true;
+            true
+        }
+    }
+
+    fn emit_scan_stopped_once(&mut self) {
+        if Self::should_emit_scan_stopped(&mut self.scan_stopped_emitted) {
+            self.base_mut().emit_signal("scan_stopped", &[]);
+        }
+    }
+
     fn scan_duration_from_secs(timeout_seconds: f64) -> Result<Duration, BleError> {
         if !timeout_seconds.is_finite() {
             return Err(BleError::ScanFailed(
@@ -412,6 +431,8 @@ impl BluetoothManager {
 
         ble_info!("Starting BLE device scan for {} seconds", timeout_seconds);
 
+        self.scan_stopped_emitted = false;
+
         // Emit scan_started signal
         self.base_mut().emit_signal("scan_started", &[]);
 
@@ -496,8 +517,7 @@ impl BluetoothManager {
         godot_print!("BluetoothManager: Stopping scan");
         scanner.stop_scan();
 
-        // Emit scan_stopped signal
-        self.base_mut().emit_signal("scan_stopped", &[]);
+        self.emit_scan_stopped_once();
     }
 
     /// Get all discovered devices from the last scan
@@ -1042,5 +1062,22 @@ mod tests {
 
         assert!(inf.is_err());
         assert!(nan.is_err());
+    }
+
+    #[test]
+    fn scan_stopped_emits_only_once_per_cycle() {
+        let mut emitted = false;
+
+        assert!(BluetoothManager::should_emit_scan_stopped(&mut emitted));
+        assert!(!BluetoothManager::should_emit_scan_stopped(&mut emitted));
+    }
+
+    #[test]
+    fn scan_stopped_allows_next_cycle_after_reset() {
+        let mut emitted = false;
+
+        assert!(BluetoothManager::should_emit_scan_stopped(&mut emitted));
+        emitted = false;
+        assert!(BluetoothManager::should_emit_scan_stopped(&mut emitted));
     }
 }
