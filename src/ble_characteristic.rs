@@ -40,7 +40,8 @@ impl BleCharacteristicInfo {
     pub fn to_dictionary(&self) -> VarDictionary {
         let mut dict = VarDictionary::new();
         dict.set("uuid", self.uuid.clone());
-        dict.set("properties", self.properties.to_dictionary());
+        let properties = self.properties.to_dictionary();
+        dict.set("properties", &properties);
         dict
     }
 }

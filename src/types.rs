@@ -73,8 +73,8 @@ pub struct DeviceInfo {
 impl DeviceInfo {
     /// 创建新的设备信息
     pub fn new(
-        address: String, 
-        name: Option<String>, 
+        address: String,
+        name: Option<String>,
         rssi: Option<i16>,
         services: Vec<String>,
         manufacturer_data: std::collections::HashMap<u16, Vec<u8>>,
@@ -96,17 +96,17 @@ impl DeviceInfo {
     pub fn to_dictionary(&self) -> VarDictionary {
         let mut dict = VarDictionary::new();
         dict.set("address", self.address.clone());
-        
+
         if let Some(ref name) = self.name {
             dict.set("name", name.clone());
         } else {
-            dict.set("name", Variant::nil());
+            dict.set("name", &Variant::nil());
         }
-        
+
         if let Some(rssi) = self.rssi {
             dict.set("rssi", rssi);
         } else {
-            dict.set("rssi", Variant::nil());
+            dict.set("rssi", &Variant::nil());
         }
 
         // Services
@@ -114,7 +114,7 @@ impl DeviceInfo {
         for service in &self.services {
             services_array.push(&GString::from(service));
         }
-        dict.set("services", services_array);
+        dict.set("services", &services_array);
 
         // Manufacturer Data
         let mut manuf_dict = VarDictionary::new();
@@ -123,9 +123,9 @@ impl DeviceInfo {
             for byte in data {
                 byte_array.push(*byte);
             }
-            manuf_dict.set(*id, byte_array);
+            manuf_dict.set(*id, &byte_array);
         }
-        dict.set("manufacturer_data", manuf_dict);
+        dict.set("manufacturer_data", &manuf_dict);
 
         // Service Data
         let mut service_data_dict = VarDictionary::new();
@@ -134,17 +134,17 @@ impl DeviceInfo {
             for byte in data {
                 byte_array.push(*byte);
             }
-            service_data_dict.set(GString::from(uuid_str), byte_array);
+            service_data_dict.set(uuid_str.as_str(), &byte_array);
         }
-        dict.set("service_data", service_data_dict);
+        dict.set("service_data", &service_data_dict);
 
         // TX Power Level
         if let Some(tx) = self.tx_power_level {
             dict.set("tx_power_level", tx);
         } else {
-            dict.set("tx_power_level", Variant::nil());
+            dict.set("tx_power_level", &Variant::nil());
         }
-        
+
         dict
     }
 }
@@ -199,9 +199,7 @@ impl BleError {
     /// 转换为字符串描述
     pub fn to_string(&self) -> String {
         match self {
-            BleError::AdapterNotFound => {
-                "未找到蓝牙适配器，请确保系统蓝牙已启用".to_string()
-            }
+            BleError::AdapterNotFound => "未找到蓝牙适配器，请确保系统蓝牙已启用".to_string(),
             BleError::DeviceNotFound(addr) => {
                 format!("未找到指定的蓝牙设备: {}", addr)
             }
@@ -211,9 +209,7 @@ impl BleError {
             BleError::OperationFailed(msg) => {
                 format!("操作失败: {}", msg)
             }
-            BleError::NotConnected => {
-                "设备未连接，请先连接设备".to_string()
-            }
+            BleError::NotConnected => "设备未连接，请先连接设备".to_string(),
             BleError::InvalidUuid(uuid) => {
                 format!("无效的 UUID: {}", uuid)
             }
@@ -311,18 +307,14 @@ impl std::error::Error for BleError {}
 #[derive(Clone, Debug)]
 pub enum BleDeviceEvent {
     /// 连接成功
-    ConnectSuccess {
-        device_address: String,
-    },
+    ConnectSuccess { device_address: String },
     /// 连接失败
     ConnectFailed {
         device_address: String,
         error: String,
     },
     /// 断开连接
-    Disconnected {
-        device_address: String,
-    },
+    Disconnected { device_address: String },
     /// 服务发现完成
     ServicesDiscovered {
         device_address: String,
@@ -403,13 +395,13 @@ impl AdapterInfo {
     pub fn to_dictionary(&self) -> VarDictionary {
         let mut dict = VarDictionary::new();
         dict.set("name", self.name.clone());
-        
+
         if let Some(ref address) = self.address {
             dict.set("address", address.clone());
         } else {
-            dict.set("address", Variant::nil());
+            dict.set("address", &Variant::nil());
         }
-        
+
         dict
     }
 }

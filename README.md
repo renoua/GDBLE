@@ -126,7 +126,7 @@ your_project/
 ├── addons/
 │   └── gdble/
 │       ├── gdble.gdextension
-│       └── libgdble.so (ARM64 或 ARMv7)
+│       └── libgdble.so (ARM64 或 x86_64)
 ├── res/
 │   └── android/
 │       ├── AndroidManifest.xml

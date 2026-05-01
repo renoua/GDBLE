@@ -366,66 +366,58 @@ jobs:
           body: |
             # GDBLE ${{ steps.get_version.outputs.version }}
             
-            ## 🔧 Bug Fixes
+            ## Highlights
             
-            ### Critical Thread Safety Fix (Issue #11, #14)
+            - Updated the Rust dependency stack for the 0.5.5 release:
+              - `godot` 0.5.2
+              - `btleplug` 0.12.0
+              - `tokio` 1.52.1
+              - `futures` 0.3.32
+            - Fixed compatibility with `godot-rust` 0.5.2 dictionary APIs by passing `Variant`, `Array`, `Dictionary`, and `PackedByteArray` values through the required reference-based `AsArg` path.
+            - Kept the public GDScript API compatible with the 0.5.x line.
+            - Refreshed Android documentation to match the currently packaged architectures.
             
-            Fixed panic/hang caused by accessing Godot API from background threads:
+            ## Fixes
             
-            - **Root Cause**: `Gd<T>` implements `!Send` and `!Sync`, meaning it cannot be safely passed across threads. Previous code attempted to call Godot API methods from Tokio async tasks (background threads), triggering panics.
+            - Fixed build/test failures caused by `VarDictionary::set()` calls after upgrading the Godot Rust bindings.
+            - Updated generated service, characteristic, device, and adapter dictionaries to work with the current Godot Rust argument passing rules.
+            - Corrected Android docs that still described ARMv7 as a build/test target.
             
-            - **Solution**: Implemented a channel-based event system:
-              - All async operations now send events through `mpsc::UnboundedSender` from background threads
-              - `BluetoothManager` processes events on the main thread via `process()` callback
-              - All Godot API calls (signals, etc.) are now executed on the main thread only
+            ## Dependencies
             
-            - **Changes**:
-              - Added `BleDeviceEvent` enum to represent all device events
-              - Refactored `BleDevice` to use event channels instead of direct API calls
-              - Added event processing in `BluetoothManager::process()`
-              - Replaced all `godot_print!`/`godot_error!` with thread-safe `eprintln!` in logging macros
+            | Dependency | Version |
+            |------------|---------|
+            | godot | 0.5.2 |
+            | btleplug | 0.12.0 |
+            | tokio | 1.52.1 |
+            | futures | 0.3.32 |
             
-            ### Multiple Devices Connection Fix
-            
-            Fixed panic when connecting multiple BLE devices simultaneously or when characteristic notification callbacks are triggered:
-            
-            - **Root Cause**: The error `Gd<T>::bind_mut() failed, already bound` occurred when multiple devices tried to emit signals at the same time, or when notification handlers from multiple devices fired callbacks concurrently.
-            
-            - **Solution**: 
-              - All Godot API calls are now deferred using `call_deferred()` to avoid borrow conflicts
-              - Events from all connected devices are collected in a single batch in `process()` method
-              - Each event is processed sequentially to prevent concurrent access to Godot objects
-            
-            - **Code Changes**:
-              - `emit_event_deferred()` uses `call_deferred()` for all signal emissions
-              - `collect_device_events()` batches all pending events before processing
-              - Events from different devices are processed in order, not concurrently
-            
-            ## 📋 API Changes
-            
-            - `Dictionary` type replaced with `VarDictionary` (godot-rust 0.4.5 compatibility)
-            
-            ## 🌍 Platform Support
+            ## Platform Support
             
             | Platform | Architecture | Status |
             |----------|--------------|--------|
-            | Windows 10+ | x86_64 | ✅ Tested |
-            | macOS 10.15+ | x86_64 | ✅ Supported |
-            | macOS 11+ | ARM64 (M1/M2) | ✅ Supported |
-            | Linux | x86_64 | ✅ Supported |
-            | Android 5.0+ | ARM64 | ⚠️ Not tested |
-            | Android 5.0+ | x86_64 | ⚠️ Not tested |
+            | Windows 10+ | x86_64 | Tested |
+            | macOS 10.15+ | x86_64 | Supported |
+            | macOS 11+ | ARM64 (Apple Silicon) | Supported |
+            | Linux | x86_64 | Supported |
+            | Android 5.0+ | ARM64 | Built, device testing recommended |
+            | Android 5.0+ | x86_64 | Built, device testing recommended |
+
+            > Note: Android ARMv7 (32-bit) is not supported due to godot-ffi compatibility issues.
+            >
+            > Android builds compile successfully, but should be tested on real devices before production use.
+
+            ## Migration from 0.5.x
             
-            > ⚠️ **Note**: Android ARMv7 (32-bit) is not supported due to godot-ffi compatibility issues.
-            > 
-            > ⚠️ **Important**: Android builds compile successfully but have not been tested on actual devices. Please test thoroughly before production use.
+            No GDScript API changes are required. Replace the addon files with the new release package and rebuild/export your Godot project.
             
-            ## 🔄 Migration from 0.5.x
+            ## Verification
             
-            No API changes required. Simply replace the addon files with the new version.
+            - `cargo test -q` passes with 10 tests.
             
-            ## 📝 Known Issues
+            ## Known Issues
             
-            - None at this time. Please report any issues on GitHub.
+            - Android ARMv7 is not supported.
+            - Android binaries still require real-device validation for production projects.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use crate::ble_characteristic::{BleCharacteristicInfo, CharacteristicProperties};
 use crate::ble_service::BleServiceInfo;
 use crate::types::{BleDeviceEvent, BleError};
-use crate::{ble_debug, ble_info, ble_warn, ble_error};
+use crate::{ble_debug, ble_error, ble_info, ble_warn};
 
 enum CharEventKind {
     Read,
@@ -107,9 +107,7 @@ impl BleDevice {
                     *is_connected.lock().unwrap() = true;
                     Ok(())
                 }
-                Err(e) => {
-                    Err(BleError::ConnectionFailed(e.to_string()))
-                }
+                Err(e) => Err(BleError::ConnectionFailed(e.to_string())),
             };
 
             if let Some(tx) = event_tx {
@@ -225,8 +223,11 @@ impl BleDevice {
         let event_tx = self.event_tx.clone();
 
         runtime.spawn(async move {
-            ble_debug!("About to call peripheral.discover_services() for {}", address);
-            
+            ble_debug!(
+                "About to call peripheral.discover_services() for {}",
+                address
+            );
+
             let result = match peripheral.discover_services().await {
                 Ok(_) => Ok(()),
                 Err(e) => Err(BleError::ServiceDiscoveryFailed(e.to_string())),
@@ -235,7 +236,7 @@ impl BleDevice {
             match result {
                 Ok(_) => {
                     ble_debug!("Service discovery successful for device: {}", address);
-                    
+
                     let services = peripheral.services();
                     let mut service_infos = Vec::new();
 
@@ -326,13 +327,13 @@ impl BleDevice {
         match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, reading value", char_uuid_str);
-                
+
                 let peripheral = self.peripheral.clone();
                 let runtime = self.runtime.clone();
                 let address = self.address.to_string();
                 let char_uuid_for_async = char_uuid_str.clone();
                 let event_tx = self.event_tx.clone();
-                
+
                 runtime.spawn(async move {
                     let result = peripheral.read(&char).await;
 
@@ -387,7 +388,11 @@ impl BleDevice {
         data: PackedByteArray,
         with_response: bool,
     ) {
-        let write_mode = if with_response { "with response" } else { "without response" };
+        let write_mode = if with_response {
+            "with response"
+        } else {
+            "without response"
+        };
         ble_debug!(
             "Writing {} bytes to characteristic {} ({}) from service {}",
             data.len(),
@@ -500,15 +505,23 @@ impl BleDevice {
         let char_uuid_str = char_uuid.to_string();
         let char_uuid_lower = char_uuid_str.to_lowercase();
 
-        if self.subscribed_characteristics.lock().unwrap().contains(&char_uuid_lower) {
-            ble_warn!("Already subscribed to characteristic {}, ignoring", char_uuid_str);
+        if self
+            .subscribed_characteristics
+            .lock()
+            .unwrap()
+            .contains(&char_uuid_lower)
+        {
+            ble_warn!(
+                "Already subscribed to characteristic {}, ignoring",
+                char_uuid_str
+            );
             return;
         }
 
         match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, subscribing", char_uuid_str);
-                
+
                 let peripheral = self.peripheral.clone();
                 let runtime = self.runtime.clone();
                 let address = self.address.to_string();
@@ -517,7 +530,7 @@ impl BleDevice {
                 let event_tx = self.event_tx.clone();
                 let subscribed_chars = self.subscribed_characteristics.clone();
                 let notification_tasks = self.notification_tasks.clone();
-                
+
                 runtime.spawn(async move {
                     let result = peripheral.subscribe(&char).await;
 
@@ -541,8 +554,12 @@ impl BleDevice {
                             let char_uuid_lower_for_insert = char_uuid_lower_for_task.clone();
 
                             let handle = tokio::spawn(async move {
-                                ble_debug!("Starting notification handler for {}", char_uuid_for_handler);
-                                let mut notification_stream = peripheral_clone.notifications().await;
+                                ble_debug!(
+                                    "Starting notification handler for {}",
+                                    char_uuid_for_handler
+                                );
+                                let mut notification_stream =
+                                    peripheral_clone.notifications().await;
 
                                 if let Ok(stream) = notification_stream.as_mut() {
                                     use futures::StreamExt;
@@ -566,13 +583,22 @@ impl BleDevice {
                                             Self::send_event_via(&event_tx_for_handler, event);
                                         }
                                     }
-                                    ble_debug!("Notification stream ended for {}", char_uuid_for_handler);
+                                    ble_debug!(
+                                        "Notification stream ended for {}",
+                                        char_uuid_for_handler
+                                    );
                                 } else {
-                                    ble_error!("Failed to get notification stream for {}", char_uuid_for_handler);
+                                    ble_error!(
+                                        "Failed to get notification stream for {}",
+                                        char_uuid_for_handler
+                                    );
                                 }
                             });
 
-                            notification_tasks.lock().unwrap().insert(char_uuid_lower_for_insert, handle);
+                            notification_tasks
+                                .lock()
+                                .unwrap()
+                                .insert(char_uuid_lower_for_insert, handle);
                         }
                         Err(e) => {
                             let error = BleError::SubscribeFailed(e.to_string());
@@ -623,7 +649,12 @@ impl BleDevice {
 
         // Abort notification task first
         let char_uuid_lower = char_uuid.to_string().to_lowercase();
-        if let Some(handle) = self.notification_tasks.lock().unwrap().remove(&char_uuid_lower) {
+        if let Some(handle) = self
+            .notification_tasks
+            .lock()
+            .unwrap()
+            .remove(&char_uuid_lower)
+        {
             handle.abort();
             ble_debug!("Aborted notification task for {}", char_uuid_lower);
         }
@@ -634,7 +665,7 @@ impl BleDevice {
         match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, unsubscribing", char_uuid_str);
-                
+
                 let peripheral = self.peripheral.clone();
                 let runtime = self.runtime.clone();
                 let address = self.address.to_string();
@@ -642,7 +673,7 @@ impl BleDevice {
                 let char_uuid_lower_for_remove = char_uuid_lower.clone();
                 let event_tx = self.event_tx.clone();
                 let subscribed_chars = self.subscribed_characteristics.clone();
-                
+
                 runtime.spawn(async move {
                     let result = peripheral.unsubscribe(&char).await;
 
@@ -700,15 +731,22 @@ impl IRefCounted for BleDevice {
 
 impl Drop for BleDevice {
     fn drop(&mut self) {
-        ble_info!("BleDevice: Cleaning up resources for device {}", self.address);
+        ble_info!(
+            "BleDevice: Cleaning up resources for device {}",
+            self.address
+        );
         self.cleanup();
     }
 }
 
 impl BleDevice {
-    pub fn new(peripheral: Peripheral, runtime: Arc<Runtime>, event_tx: Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>) -> Gd<Self> {
+    pub fn new(
+        peripheral: Peripheral,
+        runtime: Arc<Runtime>,
+        event_tx: Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>,
+    ) -> Gd<Self> {
         let address = peripheral.id().to_string();
-        
+
         let properties = runtime.block_on(async { peripheral.properties().await });
 
         let name = match properties {
@@ -744,13 +782,21 @@ impl BleDevice {
 
     fn find_characteristic(&self, service_uuid: &str, char_uuid: &str) -> Option<Characteristic> {
         let characteristics = self.peripheral.characteristics();
-        characteristics.iter().find(|c| {
-            c.uuid.to_string().eq_ignore_ascii_case(char_uuid)
-                && c.service_uuid.to_string().eq_ignore_ascii_case(service_uuid)
-        }).cloned()
+        characteristics
+            .iter()
+            .find(|c| {
+                c.uuid.to_string().eq_ignore_ascii_case(char_uuid)
+                    && c.service_uuid
+                        .to_string()
+                        .eq_ignore_ascii_case(service_uuid)
+            })
+            .cloned()
     }
 
-    fn send_event_via(tx: &Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>, event: BleDeviceEvent) {
+    fn send_event_via(
+        tx: &Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>,
+        event: BleDeviceEvent,
+    ) {
         if let Some(tx) = tx {
             if let Ok(tx_guard) = tx.lock() {
                 let _ = tx_guard.send(event);
@@ -765,10 +811,8 @@ impl BleDevice {
         service_uuid: &str,
         event_type: CharEventKind,
     ) {
-        let error = BleError::CharacteristicNotFound(format!(
-            "{} in service {}",
-            char_uuid, service_uuid
-        ));
+        let error =
+            BleError::CharacteristicNotFound(format!("{} in service {}", char_uuid, service_uuid));
         error.log_error();
 
         let event = match event_type {
@@ -827,10 +871,10 @@ impl BleDevice {
         self.notification_tasks.lock().unwrap().clear();
 
         let is_connected = *self.is_connected.lock().unwrap();
-        
+
         if is_connected {
             ble_debug!("Device {} is connected, initiating disconnect", address);
-            
+
             let sub_count = self.subscribed_characteristics.lock().unwrap().len();
             if sub_count > 0 {
                 ble_debug!("Device has {} active subscriptions", sub_count);
@@ -846,7 +890,11 @@ impl BleDevice {
                         ble_info!("Device {} disconnected during cleanup", address);
                     }
                     Err(e) => {
-                        ble_warn!("Error disconnecting device {} during cleanup: {}", address, e);
+                        ble_warn!(
+                            "Error disconnecting device {} during cleanup: {}",
+                            address,
+                            e
+                        );
                     }
                 }
                 *is_connected_clone.lock().unwrap() = false;

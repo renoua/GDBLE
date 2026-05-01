@@ -11,8 +11,10 @@ use tokio::sync::mpsc;
 use crate::ble_device::BleDevice;
 use crate::bluetooth_scanner::BluetoothScanner;
 use crate::runtime::RuntimeManager;
-use crate::types::{AdapterInfo, BleDeviceEvent, BleError, DeviceInfo, set_debug_mode, is_debug_mode};
-use crate::{ble_debug, ble_info, ble_warn, ble_error};
+use crate::types::{
+    is_debug_mode, set_debug_mode, AdapterInfo, BleDeviceEvent, BleError, DeviceInfo,
+};
+use crate::{ble_debug, ble_error, ble_info, ble_warn};
 
 /// BluetoothManager is the main entry point for BLE functionality in Godot
 ///
@@ -327,10 +329,8 @@ impl BluetoothManager {
                     "adapter_initialized",
                     &[false.to_variant(), error_msg.to_variant()],
                 );
-                self.base_mut().emit_signal(
-                    "error_occurred",
-                    &[error_msg.to_variant()],
-                );
+                self.base_mut()
+                    .emit_signal("error_occurred", &[error_msg.to_variant()]);
             }
         }
     }
@@ -399,15 +399,16 @@ impl BluetoothManager {
     /// * `timeout_seconds` - How long to scan for devices (default: 10.0 seconds)
     #[func]
     pub fn start_scan(&mut self, timeout_seconds: f64) {
-        ble_debug!("start_scan called with timeout: {} seconds", timeout_seconds);
+        ble_debug!(
+            "start_scan called with timeout: {} seconds",
+            timeout_seconds
+        );
 
         if !self.is_initialized() {
             let error = BleError::InitializationFailed("Adapter not initialized".to_string());
             error.log_error();
-            self.base_mut().emit_signal(
-                "error_occurred",
-                &[error.to_gstring().to_variant()],
-            );
+            self.base_mut()
+                .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
             return;
         }
 
@@ -416,10 +417,8 @@ impl BluetoothManager {
             None => {
                 let error = BleError::InternalError("Scanner not available".to_string());
                 error.log_error();
-                self.base_mut().emit_signal(
-                    "error_occurred",
-                    &[error.to_gstring().to_variant()],
-                );
+                self.base_mut()
+                    .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
                 return;
             }
         };
@@ -440,10 +439,8 @@ impl BluetoothManager {
             Ok(duration) => duration,
             Err(error) => {
                 error.log_error();
-                self.base_mut().emit_signal(
-                    "error_occurred",
-                    &[error.to_gstring().to_variant()],
-                );
+                self.base_mut()
+                    .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
                 return;
             }
         };
@@ -451,7 +448,7 @@ impl BluetoothManager {
         // Create channels for scan completion and device discovery
         let (complete_tx, complete_rx) = mpsc::unbounded_channel();
         let (device_tx, device_rx) = mpsc::unbounded_channel();
-        
+
         self.scan_complete_rx = Some(Arc::new(Mutex::new(complete_rx)));
         self.device_rx = Some(Arc::new(Mutex::new(device_rx)));
 
@@ -465,7 +462,10 @@ impl BluetoothManager {
                     Ok(()) => {
                         ble_debug!("scanner.start_scan() returned Ok");
                         let devices = scanner.get_devices();
-                        ble_info!("Scan completed successfully, found {} devices", devices.len());
+                        ble_info!(
+                            "Scan completed successfully, found {} devices",
+                            devices.len()
+                        );
                         ble_debug!("Discovered devices: {:?}", devices);
                         Ok(())
                     }
@@ -475,7 +475,7 @@ impl BluetoothManager {
                         Err(e.to_string())
                     }
                 };
-                
+
                 ble_debug!("Scan task completed, sending completion signal through channel");
                 // Send completion signal through channel
                 if complete_tx.send(scan_result).is_err() {
@@ -487,10 +487,8 @@ impl BluetoothManager {
         } else {
             let error = BleError::InternalError("Runtime not available".to_string());
             error.log_error();
-            self.base_mut().emit_signal(
-                "error_occurred",
-                &[error.to_gstring().to_variant()],
-            );
+            self.base_mut()
+                .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
         }
     }
 
@@ -562,10 +560,8 @@ impl BluetoothManager {
         if !self.is_initialized() {
             let error = BleError::InitializationFailed("Adapter not initialized".to_string());
             error.log_error();
-            self.base_mut().emit_signal(
-                "error_occurred",
-                &[error.to_gstring().to_variant()],
-            );
+            self.base_mut()
+                .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
             return None;
         }
 
@@ -582,15 +578,16 @@ impl BluetoothManager {
         if lock_failed {
             let error = BleError::InternalError("Device map lock poisoned".to_string());
             error.log_error();
-            self.base_mut().emit_signal(
-                "error_occurred",
-                &[error.to_gstring().to_variant()],
-            );
+            self.base_mut()
+                .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
             return None;
         }
 
         if let Some(existing_device) = existing_device {
-            ble_info!("Device {} already connected, returning existing instance", address_str);
+            ble_info!(
+                "Device {} already connected, returning existing instance",
+                address_str
+            );
             return Some(existing_device);
         }
 
@@ -599,10 +596,8 @@ impl BluetoothManager {
             None => {
                 let error = BleError::InternalError("Runtime not available".to_string());
                 error.log_error();
-                self.base_mut().emit_signal(
-                    "error_occurred",
-                    &[error.to_gstring().to_variant()],
-                );
+                self.base_mut()
+                    .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
                 return None;
             }
         };
@@ -615,15 +610,15 @@ impl BluetoothManager {
         // Use block_on to find the peripheral
         let peripheral_result = runtime.block_on(async move {
             use btleplug::api::{Central, Peripheral as _};
-            
+
             // Get all peripherals
             let peripherals = adapter.peripherals().await.ok()?;
             ble_debug!("Found {} total peripherals", peripherals.len());
-            
+
             // Find the one matching our address (UUID or MAC address)
             for peripheral in peripherals {
                 let props = peripheral.properties().await.ok()??;
-                
+
                 // Try to match by UUID first (primary method for macOS)
                 let peripheral_id = peripheral.id();
                 let peripheral_uuid = peripheral_id.to_string();
@@ -631,7 +626,7 @@ impl BluetoothManager {
                     ble_debug!("Found matching peripheral by UUID: {}", peripheral_uuid);
                     return Some(peripheral);
                 }
-                
+
                 // Also try MAC address as fallback (avoid matching 00:00:00:00:00:00)
                 let addr = props.address.to_string();
                 if !addr.eq_ignore_ascii_case("00:00:00:00:00:00") {
@@ -641,8 +636,11 @@ impl BluetoothManager {
                     }
                 }
             }
-            
-            ble_debug!("No matching peripheral found for address: {}", address_clone);
+
+            ble_debug!(
+                "No matching peripheral found for address: {}",
+                address_clone
+            );
             None
         });
 
@@ -652,25 +650,21 @@ impl BluetoothManager {
                 let error = BleError::DeviceNotFound(address_str.clone());
                 error.log_error();
                 ble_warn!("Device {} not found. Make sure to scan first.", address_str);
-                self.base_mut().emit_signal(
-                    "error_occurred",
-                    &[error.to_gstring().to_variant()],
-                );
+                self.base_mut()
+                    .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
                 return None;
             }
         };
 
         ble_debug!("Creating BleDevice instance for {}", address_str);
-        
+
         let event_tx = match &self.device_event_tx {
             Some(tx) => tx.clone(),
             None => {
                 let error = BleError::InternalError("Event channel not initialized".to_string());
                 error.log_error();
-                self.base_mut().emit_signal(
-                    "error_occurred",
-                    &[error.to_gstring().to_variant()],
-                );
+                self.base_mut()
+                    .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
                 return None;
             }
         };
@@ -688,10 +682,8 @@ impl BluetoothManager {
         if !insert_ok {
             let error = BleError::InternalError("Device map lock poisoned".to_string());
             error.log_error();
-            self.base_mut().emit_signal(
-                "error_occurred",
-                &[error.to_gstring().to_variant()],
-            );
+            self.base_mut()
+                .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
             return None;
         }
 
@@ -720,10 +712,8 @@ impl BluetoothManager {
         if lock_failed {
             let error = BleError::InternalError("Device map lock poisoned".to_string());
             error.log_error();
-            self.base_mut().emit_signal(
-                "error_occurred",
-                &[error.to_gstring().to_variant()],
-            );
+            self.base_mut()
+                .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
             return;
         }
 
@@ -805,16 +795,25 @@ impl BluetoothManager {
                 }
                 self.base_mut().call_deferred(
                     "emit_signal",
-                    &["device_connected".to_variant(), GString::from(&device_address).to_variant()],
+                    &[
+                        "device_connected".to_variant(),
+                        GString::from(&device_address).to_variant(),
+                    ],
                 );
             }
-            BleDeviceEvent::ConnectFailed { device_address, error } => {
+            BleDeviceEvent::ConnectFailed {
+                device_address,
+                error,
+            } => {
                 ble_error!("Device {} connection failed: {}", device_address, error);
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let mut obj: Gd<Object> = device.upcast();
                     obj.call_deferred(
                         "emit_signal",
-                        &["connection_failed".to_variant(), GString::from(&error).to_variant()],
+                        &[
+                            "connection_failed".to_variant(),
+                            GString::from(&error).to_variant(),
+                        ],
                     );
                 }
             }
@@ -828,28 +827,50 @@ impl BluetoothManager {
                     if let Ok(mut devices) = self.devices.lock() {
                         devices.remove(&device_address);
                     } else {
-                        ble_error!("Failed to acquire device map lock while removing disconnected device");
+                        ble_error!(
+                            "Failed to acquire device map lock while removing disconnected device"
+                        );
                     }
                 }
                 self.base_mut().call_deferred(
                     "emit_signal",
-                    &["device_disconnected".to_variant(), GString::from(&device_address).to_variant()],
+                    &[
+                        "device_disconnected".to_variant(),
+                        GString::from(&device_address).to_variant(),
+                    ],
                 );
             }
-            BleDeviceEvent::ServicesDiscovered { device_address, services } => {
-                ble_info!("Device {} discovered {} services", device_address, services.len());
+            BleDeviceEvent::ServicesDiscovered {
+                device_address,
+                services,
+            } => {
+                ble_info!(
+                    "Device {} discovered {} services",
+                    device_address,
+                    services.len()
+                );
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let services_array: Array<VarDictionary> =
                         services.iter().map(|s| s.to_dictionary()).collect();
                     let mut obj: Gd<Object> = device.upcast();
                     obj.call_deferred(
                         "emit_signal",
-                        &["services_discovered".to_variant(), services_array.to_variant()],
+                        &[
+                            "services_discovered".to_variant(),
+                            services_array.to_variant(),
+                        ],
                     );
                 }
             }
-            BleDeviceEvent::ServiceDiscoveryFailed { device_address, error } => {
-                ble_error!("Device {} service discovery failed: {}", device_address, error);
+            BleDeviceEvent::ServiceDiscoveryFailed {
+                device_address,
+                error,
+            } => {
+                ble_error!(
+                    "Device {} service discovery failed: {}",
+                    device_address,
+                    error
+                );
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let mut obj: Gd<Object> = device.upcast();
                     obj.call_deferred(
@@ -862,8 +883,17 @@ impl BluetoothManager {
                     );
                 }
             }
-            BleDeviceEvent::CharacteristicRead { device_address, char_uuid, data } => {
-                ble_debug!("Device {} read {} bytes from {}", device_address, data.len(), char_uuid);
+            BleDeviceEvent::CharacteristicRead {
+                device_address,
+                char_uuid,
+                data,
+            } => {
+                ble_debug!(
+                    "Device {} read {} bytes from {}",
+                    device_address,
+                    data.len(),
+                    char_uuid
+                );
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let packed_data = PackedByteArray::from(&data[..]);
                     let mut obj: Gd<Object> = device.upcast();
@@ -877,8 +907,17 @@ impl BluetoothManager {
                     );
                 }
             }
-            BleDeviceEvent::CharacteristicReadFailed { device_address, char_uuid, error } => {
-                ble_error!("Device {} failed to read {}: {}", device_address, char_uuid, error);
+            BleDeviceEvent::CharacteristicReadFailed {
+                device_address,
+                char_uuid,
+                error,
+            } => {
+                ble_error!(
+                    "Device {} failed to read {}: {}",
+                    device_address,
+                    char_uuid,
+                    error
+                );
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let mut obj: Gd<Object> = device.upcast();
                     obj.call_deferred(
@@ -891,18 +930,33 @@ impl BluetoothManager {
                     );
                 }
             }
-            BleDeviceEvent::CharacteristicWritten { device_address, char_uuid } => {
+            BleDeviceEvent::CharacteristicWritten {
+                device_address,
+                char_uuid,
+            } => {
                 ble_debug!("Device {} wrote to {}", device_address, char_uuid);
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let mut obj: Gd<Object> = device.upcast();
                     obj.call_deferred(
                         "emit_signal",
-                        &["characteristic_written".to_variant(), GString::from(&char_uuid).to_variant()],
+                        &[
+                            "characteristic_written".to_variant(),
+                            GString::from(&char_uuid).to_variant(),
+                        ],
                     );
                 }
             }
-            BleDeviceEvent::CharacteristicWriteFailed { device_address, char_uuid, error } => {
-                ble_error!("Device {} failed to write {}: {}", device_address, char_uuid, error);
+            BleDeviceEvent::CharacteristicWriteFailed {
+                device_address,
+                char_uuid,
+                error,
+            } => {
+                ble_error!(
+                    "Device {} failed to write {}: {}",
+                    device_address,
+                    char_uuid,
+                    error
+                );
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let mut obj: Gd<Object> = device.upcast();
                     obj.call_deferred(
@@ -915,8 +969,17 @@ impl BluetoothManager {
                     );
                 }
             }
-            BleDeviceEvent::CharacteristicNotified { device_address, char_uuid, data } => {
-                ble_debug!("Device {} notification from {}: {} bytes", device_address, char_uuid, data.len());
+            BleDeviceEvent::CharacteristicNotified {
+                device_address,
+                char_uuid,
+                data,
+            } => {
+                ble_debug!(
+                    "Device {} notification from {}: {} bytes",
+                    device_address,
+                    char_uuid,
+                    data.len()
+                );
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let packed_data = PackedByteArray::from(&data[..]);
                     let mut obj: Gd<Object> = device.upcast();
@@ -930,11 +993,23 @@ impl BluetoothManager {
                     );
                 }
             }
-            BleDeviceEvent::SubscribeSuccess { device_address, char_uuid } => {
+            BleDeviceEvent::SubscribeSuccess {
+                device_address,
+                char_uuid,
+            } => {
                 ble_info!("Device {} subscribed to {}", device_address, char_uuid);
             }
-            BleDeviceEvent::SubscribeFailed { device_address, char_uuid, error } => {
-                ble_error!("Device {} failed to subscribe {}: {}", device_address, char_uuid, error);
+            BleDeviceEvent::SubscribeFailed {
+                device_address,
+                char_uuid,
+                error,
+            } => {
+                ble_error!(
+                    "Device {} failed to subscribe {}: {}",
+                    device_address,
+                    char_uuid,
+                    error
+                );
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let mut obj: Gd<Object> = device.upcast();
                     obj.call_deferred(
@@ -947,11 +1022,23 @@ impl BluetoothManager {
                     );
                 }
             }
-            BleDeviceEvent::UnsubscribeSuccess { device_address, char_uuid } => {
+            BleDeviceEvent::UnsubscribeSuccess {
+                device_address,
+                char_uuid,
+            } => {
                 ble_info!("Device {} unsubscribed from {}", device_address, char_uuid);
             }
-            BleDeviceEvent::UnsubscribeFailed { device_address, char_uuid, error } => {
-                ble_error!("Device {} failed to unsubscribe {}: {}", device_address, char_uuid, error);
+            BleDeviceEvent::UnsubscribeFailed {
+                device_address,
+                char_uuid,
+                error,
+            } => {
+                ble_error!(
+                    "Device {} failed to unsubscribe {}: {}",
+                    device_address,
+                    char_uuid,
+                    error
+                );
                 if let Some(device) = self.get_device_by_address(&device_address) {
                     let mut obj: Gd<Object> = device.upcast();
                     obj.call_deferred(
@@ -1032,7 +1119,7 @@ impl BluetoothManager {
         self.scanner = None;
         self.adapter = None;
         self.runtime = None;
-        
+
         ble_info!("Bluetooth cleanup complete");
     }
 }
