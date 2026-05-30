@@ -716,40 +716,39 @@ impl BluetoothManager {
         let address_clone = address_str.clone();
 
         ble_debug!("Searching for peripheral with address: {}", address_clone);
-        // Use block_on to find the peripheral
+        // Use block_on to find the peripheral.
+        // IMPORTANT: peripheral.id().to_string() is synchronous and gives the MAC address on
+        // Windows/Linux and a UUID on macOS. We match by ID first (no await = no WinRT round-trip)
+        // and only fall back to properties().await for macOS UUID-based addressing.
         let peripheral_result = runtime.block_on(async move {
             use btleplug::api::{Central, Peripheral as _};
 
-            // Get all peripherals
             let peripherals = adapter.peripherals().await.ok()?;
             ble_debug!("Found {} total peripherals", peripherals.len());
 
-            // Find the one matching our address (UUID or MAC address)
-            for peripheral in peripherals {
-                let props = peripheral.properties().await.ok()??;
-
-                // Try to match by UUID first (primary method for macOS)
-                let peripheral_id = peripheral.id();
-                let peripheral_uuid = peripheral_id.to_string();
-                if peripheral_uuid.eq_ignore_ascii_case(&address_clone) {
-                    ble_debug!("Found matching peripheral by UUID: {}", peripheral_uuid);
-                    return Some(peripheral);
+            // Pass 1: match by peripheral ID — synchronous, no WinRT/D-Bus round-trip.
+            // On Windows and Linux this IS the MAC address; on macOS it is a UUID.
+            for peripheral in &peripherals {
+                if peripheral.id().to_string().eq_ignore_ascii_case(&address_clone) {
+                    ble_debug!("Found peripheral by ID: {}", address_clone);
+                    return Some(peripheral.clone());
                 }
+            }
 
-                // Also try MAC address as fallback (avoid matching 00:00:00:00:00:00)
-                let addr = props.address.to_string();
-                if !addr.eq_ignore_ascii_case("00:00:00:00:00:00") {
-                    if addr.eq_ignore_ascii_case(&address_clone) {
-                        ble_debug!("Found matching peripheral by MAC: {}", addr);
+            // Pass 2: fallback — match by MAC address from properties (macOS UUID addressing).
+            for peripheral in peripherals {
+                if let Ok(Some(props)) = peripheral.properties().await {
+                    let addr = props.address.to_string();
+                    if !addr.eq_ignore_ascii_case("00:00:00:00:00:00")
+                        && addr.eq_ignore_ascii_case(&address_clone)
+                    {
+                        ble_debug!("Found peripheral by MAC (props fallback): {}", addr);
                         return Some(peripheral);
                     }
                 }
             }
 
-            ble_debug!(
-                "No matching peripheral found for address: {}",
-                address_clone
-            );
+            ble_debug!("No matching peripheral found for address: {}", address_clone);
             None
         });
 
