@@ -54,6 +54,9 @@ pub struct BluetoothManager {
 
     /// Initialization state
     is_initialized: Arc<Mutex<bool>>,
+
+    /// Pending async adapter init result — polled in process()
+    init_result: Option<Arc<Mutex<Option<Result<Adapter, BleError>>>>>,
 }
 
 #[godot_api]
@@ -73,6 +76,7 @@ impl INode for BluetoothManager {
             device_event_tx: None,
             devices: Arc::new(Mutex::new(HashMap::new())),
             is_initialized: Arc::new(Mutex::new(false)),
+            init_result: None,
         }
     }
 
@@ -125,6 +129,21 @@ impl INode for BluetoothManager {
                     self.emit_scan_stopped_once();
                 }
             }
+        }
+
+        // Poll async adapter init result (set by non-blocking initialize())
+        let init_ready = if let Some(ref slot_arc) = self.init_result {
+            if let Ok(mut slot) = slot_arc.lock() {
+                slot.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(result) = init_ready {
+            self.init_result = None;
+            self.handle_init_result(result);
         }
 
         let events = self.collect_device_events();
@@ -333,9 +352,7 @@ impl BluetoothManager {
     #[func]
     pub fn initialize(&mut self) {
         ble_info!("Starting Bluetooth adapter initialization");
-        ble_debug!("Checking initialization state");
 
-        // Check if already initialized
         if self.check_already_initialized() {
             ble_warn!("Adapter already initialized, skipping initialization");
             self.base_mut().emit_signal(
@@ -345,45 +362,64 @@ impl BluetoothManager {
             return;
         }
 
+        // Guard against double-init while a previous spawn is still pending
+        if self.init_result.is_some() {
+            ble_warn!("Adapter initialization already in progress");
+            return;
+        }
+
         ble_debug!("Creating Tokio runtime manager");
-        // Create runtime manager
         let runtime_manager = RuntimeManager::new();
         self.runtime = Some(Arc::new(runtime_manager));
 
-        // Get adapter synchronously using block_on
-        ble_debug!("Acquiring Bluetooth adapter");
-        let result = if let Some(ref runtime_mgr) = self.runtime {
-            runtime_mgr.block_on(Self::get_adapter_async())
+        // Spawn adapter acquisition asynchronously — result polled in process()
+        // to avoid blocking the Godot main thread (WinRT/BlueZ init can take seconds).
+        ble_debug!("Spawning async adapter acquisition");
+        let slot: Arc<Mutex<Option<Result<Adapter, BleError>>>> =
+            Arc::new(Mutex::new(None));
+        let slot_clone = slot.clone();
+        if let Some(ref runtime_mgr) = self.runtime {
+            runtime_mgr.spawn(async move {
+                let result = Self::get_adapter_async().await;
+                if let Ok(mut guard) = slot_clone.lock() {
+                    *guard = Some(result);
+                }
+            });
+            self.init_result = Some(slot);
+            ble_debug!("Adapter acquisition task spawned, returning immediately");
         } else {
             let error = BleError::InitializationFailed("Runtime not created".to_string());
             error.log_error();
-            Err(error)
-        };
+            let error_msg = GString::from(error.to_string().as_str());
+            self.base_mut().emit_signal(
+                "adapter_initialized",
+                &[false.to_variant(), error_msg.to_variant()],
+            );
+            self.base_mut()
+                .emit_signal("error_occurred", &[error_msg.to_variant()]);
+        }
+    }
 
+    /// Called from process() when the async adapter init result is ready.
+    fn handle_init_result(&mut self, result: Result<Adapter, BleError>) {
         match result {
             Ok(adapter) => {
                 ble_info!("Bluetooth adapter acquired successfully");
                 let adapter_arc = Arc::new(adapter);
                 self.adapter = Some(adapter_arc.clone());
 
-                // Create scanner
                 ble_debug!("Creating Bluetooth scanner");
                 if let Some(ref runtime_mgr) = self.runtime {
                     let scanner = BluetoothScanner::new(adapter_arc, runtime_mgr.runtime());
                     self.scanner = Some(Arc::new(scanner));
-                    ble_debug!("Scanner created successfully");
                 }
 
-                // Create device event channel (shared across all devices)
                 let (event_tx, event_rx) = mpsc::unbounded_channel::<BleDeviceEvent>();
                 self.device_event_tx = Some(Arc::new(Mutex::new(event_tx)));
                 self.device_event_rx = Some(Arc::new(Mutex::new(event_rx)));
-                ble_debug!("Device event channel created");
 
-                // Mark as initialized
                 self.set_initialized(true);
                 ble_info!("Bluetooth initialization complete");
-
                 self.base_mut().emit_signal(
                     "adapter_initialized",
                     &[true.to_variant(), GString::new().to_variant()],
@@ -1182,7 +1218,8 @@ impl BluetoothManager {
             ble_error!("Failed to acquire initialization lock during cleanup");
         }
 
-        // Drop scanner, adapter and runtime
+        // Drop pending init task, scanner, adapter and runtime
+        self.init_result = None;
         self.scanner = None;
         self.adapter = None;
         self.runtime = None;
