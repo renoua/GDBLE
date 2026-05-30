@@ -1,5 +1,5 @@
-use godot::prelude::*;
 use crate::ble_characteristic::BleCharacteristicInfo;
+use godot::prelude::*;
 
 /// BLE 服务信息
 #[derive(Clone, Debug)]
@@ -17,18 +17,19 @@ impl BleServiceInfo {
         }
     }
 
-    /// 转换为 Godot Dictionary
-    pub fn to_dictionary(&self) -> Dictionary {
-        let mut dict = Dictionary::new();
+    /// 转换为 Godot VarDictionary
+    pub fn to_dictionary(&self) -> VarDictionary {
+        let mut dict = VarDictionary::new();
         dict.set("uuid", self.uuid.clone());
-        
-        let chars_array: Array<Dictionary> = self.characteristics
+
+        let chars_array: Array<VarDictionary> = self
+            .characteristics
             .iter()
             .map(|char_info| char_info.to_dictionary())
             .collect();
-        
-        dict.set("characteristics", chars_array);
-        
+
+        dict.set("characteristics", &chars_array);
+
         dict
     }
 }

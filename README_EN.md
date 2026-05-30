@@ -123,11 +123,28 @@ GDBLE is a Bluetooth Low Energy (BLE) plugin designed for Godot 4, built with Ru
 
 ## Platform Support
 
-| Platform | Status | Version Required |
-| -------- | ------ | ---------------- |
-| Windows  | ✅     | Windows 10+      |
-| macOS    | ✅     | macOS 10.15+     |
-| Linux    | 🚧     | In Development   |
+| Platform | Architecture | Status | Version Required |
+| -------- | ------------ | ------ | ---------------- |
+| Windows  | x86_64       | ✅ Tested | Windows 10+      |
+| macOS    | x86_64       | ✅ Supported | macOS 10.15+     |
+| macOS    | ARM64 (M1/M2)| ✅ Supported | macOS 11+        |
+| Linux    | x86_64       | ✅ Supported | Ubuntu 20.04+    |
+| Android  | ARM64        | ⚠️ Not tested | Android 5.0+ (API 21+) |
+| Android  | x86_64       | ⚠️ Not tested | Android 5.0+ (API 21+) |
+
+> ⚠️ **Note**: Android ARMv7 (32-bit) architecture is not supported. Please use ARM64 or x86_64 architectures.
+> 
+> ⚠️ **Important**: Android builds compile successfully but have not been tested on actual devices. Please test thoroughly before production use.
+
+### Thread Safety
+
+Starting from v0.5.3, GDBLE uses a channel-based event system to ensure thread safety:
+
+- All async operations send events through `mpsc::UnboundedSender` from background threads
+- `BluetoothManager` processes events on the main thread via `process()` callback
+- All Godot API calls (signal emissions, etc.) are executed on the main thread only
+
+This resolves the panic/hang issues caused by calling Godot API from background threads in previous versions (Issue #11, #14).
 
 ---
 

@@ -15,41 +15,45 @@ pub fn is_debug_mode() -> bool {
 }
 
 /// 调试日志宏 - 仅在调试模式下输出
+/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_debug {
     ($($arg:tt)*) => {
         if $crate::types::is_debug_mode() {
-            godot::prelude::godot_print!("[BLE Debug] {}", format!($($arg)*));
+            eprintln!("[BLE Debug] {}", format!($($arg)*));
         }
     };
 }
 
 /// 信息日志宏 - 仅在调试模式下输出
+/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_info {
     ($($arg:tt)*) => {
         if $crate::types::is_debug_mode() {
-            godot::prelude::godot_print!("[BLE Info] {}", format!($($arg)*));
+            eprintln!("[BLE Info] {}", format!($($arg)*));
         }
     };
 }
 
 /// 警告日志宏 - 仅在调试模式下输出
+/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_warn {
     ($($arg:tt)*) => {
         if $crate::types::is_debug_mode() {
-            godot::prelude::godot_warn!("[BLE Warning] {}", format!($($arg)*));
+            eprintln!("[BLE Warning] {}", format!($($arg)*));
         }
     };
 }
 
 /// 错误日志宏 - 仅在调试模式下输出
+/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_error {
     ($($arg:tt)*) => {
         if $crate::types::is_debug_mode() {
-            godot::prelude::godot_error!("[BLE Error] {}", format!($($arg)*));
+            eprintln!("[BLE Error] {}", format!($($arg)*));
         }
     };
 }
@@ -64,18 +68,24 @@ pub struct DeviceInfo {
     pub manufacturer_data: std::collections::HashMap<u16, Vec<u8>>,
     pub service_data: std::collections::HashMap<String, Vec<u8>>,
     pub tx_power_level: Option<i16>,
+    pub paired: bool,
+    pub can_pair: bool,
+    pub pairing_status: String,
 }
 
 impl DeviceInfo {
     /// 创建新的设备信息
     pub fn new(
-        address: String, 
-        name: Option<String>, 
+        address: String,
+        name: Option<String>,
         rssi: Option<i16>,
         services: Vec<String>,
         manufacturer_data: std::collections::HashMap<u16, Vec<u8>>,
         service_data: std::collections::HashMap<String, Vec<u8>>,
         tx_power_level: Option<i16>,
+        paired: bool,
+        can_pair: bool,
+        pairing_status: String,
     ) -> Self {
         Self {
             address,
@@ -85,24 +95,27 @@ impl DeviceInfo {
             manufacturer_data,
             service_data,
             tx_power_level,
+            paired,
+            can_pair,
+            pairing_status,
         }
     }
 
-    /// 转换为 Godot Dictionary
-    pub fn to_dictionary(&self) -> Dictionary {
-        let mut dict = Dictionary::new();
+    /// 转换为 Godot VarDictionary
+    pub fn to_dictionary(&self) -> VarDictionary {
+        let mut dict = VarDictionary::new();
         dict.set("address", self.address.clone());
-        
+
         if let Some(ref name) = self.name {
             dict.set("name", name.clone());
         } else {
-            dict.set("name", Variant::nil());
+            dict.set("name", &Variant::nil());
         }
-        
+
         if let Some(rssi) = self.rssi {
             dict.set("rssi", rssi);
         } else {
-            dict.set("rssi", Variant::nil());
+            dict.set("rssi", &Variant::nil());
         }
 
         // Services
@@ -110,37 +123,43 @@ impl DeviceInfo {
         for service in &self.services {
             services_array.push(&GString::from(service));
         }
-        dict.set("services", services_array);
+        dict.set("services", &services_array);
+        dict.set("service_uuids", &services_array);
+        dict.set("uuids", &services_array);
 
         // Manufacturer Data
-        let mut manuf_dict = Dictionary::new();
+        let mut manuf_dict = VarDictionary::new();
         for (id, data) in &self.manufacturer_data {
             let mut byte_array = PackedByteArray::new();
             for byte in data {
                 byte_array.push(*byte);
             }
-            manuf_dict.set(*id, byte_array);
+            manuf_dict.set(*id, &byte_array);
         }
-        dict.set("manufacturer_data", manuf_dict);
+        dict.set("manufacturer_data", &manuf_dict);
 
         // Service Data
-        let mut service_data_dict = Dictionary::new();
+        let mut service_data_dict = VarDictionary::new();
         for (uuid_str, data) in &self.service_data {
             let mut byte_array = PackedByteArray::new();
             for byte in data {
                 byte_array.push(*byte);
             }
-            service_data_dict.set(GString::from(uuid_str), byte_array);
+            service_data_dict.set(uuid_str.as_str(), &byte_array);
         }
-        dict.set("service_data", service_data_dict);
+        dict.set("service_data", &service_data_dict);
 
         // TX Power Level
         if let Some(tx) = self.tx_power_level {
             dict.set("tx_power_level", tx);
         } else {
-            dict.set("tx_power_level", Variant::nil());
+            dict.set("tx_power_level", &Variant::nil());
         }
-        
+
+        dict.set("paired", self.paired);
+        dict.set("can_pair", self.can_pair);
+        dict.set("pairing_status", self.pairing_status.clone());
+
         dict
     }
 }
@@ -195,9 +214,7 @@ impl BleError {
     /// 转换为字符串描述
     pub fn to_string(&self) -> String {
         match self {
-            BleError::AdapterNotFound => {
-                "未找到蓝牙适配器，请确保系统蓝牙已启用".to_string()
-            }
+            BleError::AdapterNotFound => "未找到蓝牙适配器，请确保系统蓝牙已启用".to_string(),
             BleError::DeviceNotFound(addr) => {
                 format!("未找到指定的蓝牙设备: {}", addr)
             }
@@ -207,9 +224,7 @@ impl BleError {
             BleError::OperationFailed(msg) => {
                 format!("操作失败: {}", msg)
             }
-            BleError::NotConnected => {
-                "设备未连接，请先连接设备".to_string()
-            }
+            BleError::NotConnected => "设备未连接，请先连接设备".to_string(),
             BleError::InvalidUuid(uuid) => {
                 format!("无效的 UUID: {}", uuid)
             }
@@ -284,14 +299,14 @@ impl BleError {
         )
     }
 
-    /// 记录错误到 Godot 控制台
+    /// 记录错误到控制台（线程安全）
     pub fn log_error(&self) {
-        godot_error!("[BLE Error] {}: {}", self.error_code(), self.to_string());
+        eprintln!("[BLE Error] {}: {}", self.error_code(), self.to_string());
     }
 
-    /// 记录警告到 Godot 控制台
+    /// 记录警告到控制台（线程安全）
     pub fn log_warning(&self) {
-        godot_warn!("[BLE Warning] {}: {}", self.error_code(), self.to_string());
+        eprintln!("[BLE Warning] {}: {}", self.error_code(), self.to_string());
     }
 }
 
@@ -302,6 +317,81 @@ impl std::fmt::Display for BleError {
 }
 
 impl std::error::Error for BleError {}
+
+/// 设备事件枚举 - 用于从后台线程发送事件到主线程
+#[derive(Clone, Debug)]
+pub enum BleDeviceEvent {
+    /// 连接成功
+    ConnectSuccess { device_address: String },
+    /// 连接失败
+    ConnectFailed {
+        device_address: String,
+        error: String,
+    },
+    /// 断开连接
+    Disconnected { device_address: String },
+    /// 服务发现完成
+    ServicesDiscovered {
+        device_address: String,
+        services: Vec<BleServiceInfo>,
+    },
+    /// 服务发现失败
+    ServiceDiscoveryFailed {
+        device_address: String,
+        error: String,
+    },
+    /// 特征值读取完成
+    CharacteristicRead {
+        device_address: String,
+        char_uuid: String,
+        data: Vec<u8>,
+    },
+    /// 特征值读取失败
+    CharacteristicReadFailed {
+        device_address: String,
+        char_uuid: String,
+        error: String,
+    },
+    /// 特征值写入完成
+    CharacteristicWritten {
+        device_address: String,
+        char_uuid: String,
+    },
+    /// 特征值写入失败
+    CharacteristicWriteFailed {
+        device_address: String,
+        char_uuid: String,
+        error: String,
+    },
+    /// 特征值通知
+    CharacteristicNotified {
+        device_address: String,
+        char_uuid: String,
+        data: Vec<u8>,
+    },
+    /// 订阅成功
+    SubscribeSuccess {
+        device_address: String,
+        char_uuid: String,
+    },
+    /// 订阅失败
+    SubscribeFailed {
+        device_address: String,
+        char_uuid: String,
+        error: String,
+    },
+    /// 取消订阅成功
+    UnsubscribeSuccess {
+        device_address: String,
+        char_uuid: String,
+    },
+    /// 取消订阅失败
+    UnsubscribeFailed {
+        device_address: String,
+        char_uuid: String,
+        error: String,
+    },
+}
 
 /// 适配器信息结构
 #[derive(Clone, Debug)]
@@ -316,17 +406,17 @@ impl AdapterInfo {
         Self { name, address }
     }
 
-    /// 转换为 Godot Dictionary
-    pub fn to_dictionary(&self) -> Dictionary {
-        let mut dict = Dictionary::new();
+    /// 转换为 Godot VarDictionary
+    pub fn to_dictionary(&self) -> VarDictionary {
+        let mut dict = VarDictionary::new();
         dict.set("name", self.name.clone());
-        
+
         if let Some(ref address) = self.address {
             dict.set("address", address.clone());
         } else {
-            dict.set("address", Variant::nil());
+            dict.set("address", &Variant::nil());
         }
-        
+
         dict
     }
 }

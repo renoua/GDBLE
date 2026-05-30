@@ -7,7 +7,6 @@ This guide explains how to build and use GDBLE on Android platform.
 1. **Rust toolchain** with Android targets:
    ```bash
    rustup target add aarch64-linux-android
-   rustup target add armv7-linux-androideabi
    rustup target add x86_64-linux-android
    ```
 
@@ -25,7 +24,9 @@ This guide explains how to build and use GDBLE on Android platform.
 
 The easiest way is to let GitHub Actions build for you. The workflow automatically builds for:
 - Android ARM64 (aarch64-linux-android)
-- Android ARMv7 (armv7-linux-androideabi)
+- Android x86_64 (x86_64-linux-android)
+
+Android ARMv7 (32-bit) is not supported due to godot-ffi compatibility issues.
 
 Simply push a tag or trigger the workflow manually:
 ```bash
@@ -45,9 +46,6 @@ git push origin v1.0.0
    ```bash
    # ARM64 (most common for modern devices)
    cargo build --release --target aarch64-linux-android
-
-   # ARMv7 (older devices)
-   cargo build --release --target armv7-linux-androideabi
 
    # x86_64 (emulators)
    cargo build --release --target x86_64-linux-android
@@ -201,8 +199,8 @@ Android has restrictions on background BLE scanning:
 ### Device Compatibility
 
 - **ARM64**: Most modern Android devices (recommended)
-- **ARMv7**: Older devices with 32-bit ARM
 - **x86_64**: Intel-based devices and emulators
+- **ARMv7**: Not supported due to godot-ffi compatibility issues
 
 ### Performance Tips
 
@@ -239,7 +237,7 @@ Android has restrictions on background BLE scanning:
 
 1. **Use real devices**: Emulators often don't support BLE
 2. **Test multiple Android versions**: Android 11, 12, 13+
-3. **Test different architectures**: ARM64 and ARMv7
+3. **Test different architectures**: ARM64 and x86_64
 4. **Use BLE debugging tools**: nRF Connect, LightBlue
 
 ## Additional Resources

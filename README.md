@@ -72,16 +72,28 @@ GDBLE 是一个为 Godot 4 设计的蓝牙低功耗（BLE）插件，使用 Rust
 
 ## 平台支持
 
-| 平台      | 状态  | 版本要求        |
-| ------- | --- | ----------- |
-| Windows | ✅   | Windows 10+ |
-| macOS   | ✅   | macOS 10.15+ |
-| Android | ✅   | Android 5.0+ (API 21+) |
-| Linux   | 🚧  | 开发中         |
+| 平台      | 架构 | 状态  | 版本要求        |
+| ------- | --- | --- | ----------- |
+| Windows | x86_64 | ✅ 已测试 | Windows 10+ |
+| macOS   | x86_64 | ✅ 支持 | macOS 10.15+ |
+| macOS   | ARM64 (M1/M2) | ✅ 支持 | macOS 11+ |
+| Linux   | x86_64 | ✅ 支持 | Ubuntu 20.04+ |
+| Android | ARM64 | ⚠️ 未测试 | Android 5.0+ (API 21+) |
+| Android | x86_64 | ⚠️ 未测试 | Android 5.0+ (API 21+) |
 
-> 💡 **Android 用户**: 请查看 [Android 构建指南](ANDROID_BUILD.md) 了解详细的配置和使用说明。
-> 
 > ⚠️ **注意**: Android ARMv7 (32位) 架构暂不支持，请使用 ARM64 或 x86_64 架构。
+> 
+> ⚠️ **重要**: Android 版本编译成功但未在实际设备上测试，请在生产环境使用前充分测试。
+
+### 线程安全说明
+
+从 v0.5.3 版本开始，GDBLE 使用基于 Channel 的事件系统确保线程安全：
+
+- 所有异步操作通过 `mpsc::UnboundedSender` 从后台线程发送事件
+- `BluetoothManager` 在主线程的 `process()` 回调中处理事件
+- 所有 Godot API 调用（信号发射等）仅在主线程执行
+
+这解决了之前版本中从后台线程调用 Godot API 导致的 panic/hang 问题（Issue #11, #14）。
 
 ---
 
@@ -114,7 +126,7 @@ your_project/
 ├── addons/
 │   └── gdble/
 │       ├── gdble.gdextension
-│       └── libgdble.so (ARM64 或 ARMv7)
+│       └── libgdble.so (ARM64 或 x86_64)
 ├── res/
 │   └── android/
 │       ├── AndroidManifest.xml

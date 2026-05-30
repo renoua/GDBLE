@@ -1,14 +1,23 @@
 use btleplug::api::{CharPropFlags, Characteristic, Peripheral as _, WriteType};
 use btleplug::platform::Peripheral;
 use godot::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::ble_characteristic::{BleCharacteristicInfo, CharacteristicProperties};
 use crate::ble_service::BleServiceInfo;
-use crate::types::BleError;
-use crate::{ble_debug, ble_info, ble_error};
+use crate::types::{BleDeviceEvent, BleError};
+use crate::{ble_debug, ble_error, ble_info, ble_warn};
+
+enum CharEventKind {
+    Read,
+    Write,
+    Subscribe,
+    Unsubscribe,
+}
 
 /// BleDevice represents a single BLE peripheral device
 ///
@@ -39,6 +48,12 @@ pub struct BleDevice {
 
     /// Set of subscribed characteristic UUIDs (stored as lowercase strings)
     subscribed_characteristics: Arc<Mutex<HashSet<String>>>,
+
+    /// Notification task handles by characteristic UUID (for cleanup)
+    notification_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+
+    /// Event sender for thread-safe communication with BluetoothManager
+    event_tx: Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>,
 }
 
 #[godot_api]
@@ -52,54 +67,30 @@ impl BleDevice {
     fn disconnected();
 
     /// Signal emitted when connection fails
-    ///
-    /// # Parameters
-    /// * error: String - Error message describing the failure
     #[signal]
     fn connection_failed(error: GString);
 
     /// Signal emitted when services are discovered
-    ///
-    /// # Parameters
-    /// * services: Array - Array of service dictionaries
     #[signal]
-    fn services_discovered(services: Array<Dictionary>);
+    fn services_discovered(services: Array<VarDictionary>);
 
     /// Signal emitted when a characteristic is read
-    ///
-    /// # Parameters
-    /// * char_uuid: String - UUID of the characteristic
-    /// * data: PackedByteArray - Data read from the characteristic
     #[signal]
     fn characteristic_read(char_uuid: GString, data: PackedByteArray);
 
     /// Signal emitted when a characteristic is written
-    ///
-    /// # Parameters
-    /// * char_uuid: String - UUID of the characteristic
     #[signal]
     fn characteristic_written(char_uuid: GString);
 
     /// Signal emitted when a characteristic notification is received
-    ///
-    /// # Parameters
-    /// * char_uuid: String - UUID of the characteristic
-    /// * data: PackedByteArray - Notification data
     #[signal]
     fn characteristic_notified(char_uuid: GString, data: PackedByteArray);
 
     /// Signal emitted when an operation fails
-    ///
-    /// # Parameters
-    /// * operation: String - Name of the failed operation
-    /// * error: String - Error message
     #[signal]
     fn operation_failed(operation: GString, error: GString);
 
     /// Asynchronously connect to the device
-    ///
-    /// This method initiates a connection to the BLE device. The result
-    /// is communicated through the `connected` or `connection_failed` signals.
     #[func]
     fn connect_async(&mut self) {
         let address = self.address.to_string();
@@ -108,138 +99,111 @@ impl BleDevice {
         let peripheral = self.peripheral.clone();
         let runtime = self.runtime.clone();
         let is_connected = self.is_connected.clone();
+        let event_tx = self.event_tx.clone();
 
-        // Get instance ID for callback
-        let instance_id = self.base().instance_id();
-
-        // Execute connection asynchronously
         runtime.spawn(async move {
-            // ble_debug!("About to call peripheral.connect() for {}", address);
-            
             let result = match peripheral.connect().await {
                 Ok(_) => {
-                    // ble_debug!("peripheral.connect() returned Ok for {}", address);
                     *is_connected.lock().unwrap() = true;
-                    // ble_info!("Successfully connected to device: {}", address);
                     Ok(())
                 }
-                Err(e) => {
-                    // ble_debug!("peripheral.connect() returned Err for {}: {}", address, e);
-                    Err(BleError::ConnectionFailed(e.to_string()))
-                }
+                Err(e) => Err(BleError::ConnectionFailed(e.to_string())),
             };
 
-            // Handle result on main thread
-            match result {
-                Ok(_) => {
-                    // ble_debug!("Attempting to emit connected signal for {}", address);
-                    if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                        // ble_debug!("Found device instance, calling _on_connect_success");
-                        obj.call_deferred("_on_connect_success", &[]);
-                    } else {
-                        ble_error!("Failed to get device instance for callback");
-                    }
-                }
-                Err(error) => {
-                    // ble_debug!("Connection failed for device: {}", address);
-                    error.log_error();
-                    
-                    if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                        // ble_debug!("Found device instance, calling _on_connect_failed");
-                        obj.call_deferred(
-                            "_on_connect_failed",
-                            &[error.to_gstring().to_variant()],
-                        );
-                    } else {
-                        ble_error!("Failed to get device instance for error callback");
-                    }
+            if let Some(tx) = event_tx {
+                let event = match result {
+                    Ok(_) => BleDeviceEvent::ConnectSuccess {
+                        device_address: address,
+                    },
+                    Err(error) => BleDeviceEvent::ConnectFailed {
+                        device_address: address,
+                        error: error.to_string(),
+                    },
+                };
+                if let Ok(tx_guard) = tx.lock() {
+                    let _ = tx_guard.send(event);
                 }
             }
         });
     }
 
     /// Disconnect from the device
-    ///
-    /// This method disconnects from the BLE device if currently connected.
-    /// The `disconnected` signal is emitted upon successful disconnection.
-    /// All active subscriptions are automatically cleared.
     #[func]
     fn disconnect(&mut self) {
         let address = self.address.to_string();
         ble_debug!("Initiating disconnect for device: {}", address);
 
+        // Abort all notification tasks
+        let notification_tasks = self.notification_tasks.lock().unwrap();
+        let task_count = notification_tasks.len();
+        if task_count > 0 {
+            ble_debug!("Aborting {} notification tasks", task_count);
+            for (_, handle) in notification_tasks.iter() {
+                handle.abort();
+            }
+        }
+        drop(notification_tasks);
+        self.notification_tasks.lock().unwrap().clear();
+
         let peripheral = self.peripheral.clone();
         let runtime = self.runtime.clone();
         let is_connected = self.is_connected.clone();
         let subscribed_chars = self.subscribed_characteristics.clone();
+        let event_tx = self.event_tx.clone();
 
         runtime.spawn(async move {
             match peripheral.disconnect().await {
                 Ok(_) => {
                     *is_connected.lock().unwrap() = false;
-                    // Clear all subscriptions
                     let sub_count = subscribed_chars.lock().unwrap().len();
                     subscribed_chars.lock().unwrap().clear();
-                    // ble_info!("Device {} disconnected successfully", address);
                     if sub_count > 0 {
                         ble_debug!("Cleared {} subscriptions", sub_count);
                     }
                 }
                 Err(e) => {
                     let error = BleError::OperationFailed(format!("Disconnect failed: {}", e));
-                    error.log_warning(); // Use warning since we'll mark as disconnected anyway
-                    // Still mark as disconnected since we can't maintain the connection
+                    error.log_warning();
                     *is_connected.lock().unwrap() = false;
-                    // Clear all subscriptions
                     subscribed_chars.lock().unwrap().clear();
                 }
             }
-        });
 
-        // Emit signal immediately on the main thread
-        self.base_mut().emit_signal("disconnected", &[]);
+            if let Some(tx) = event_tx {
+                let event = BleDeviceEvent::Disconnected {
+                    device_address: address,
+                };
+                if let Ok(tx_guard) = tx.lock() {
+                    let _ = tx_guard.send(event);
+                }
+            }
+        });
     }
 
     /// Check if the device is currently connected
-    ///
-    /// # Returns
-    /// true if the device is connected, false otherwise
     #[func]
     pub fn is_connected(&self) -> bool {
         *self.is_connected.lock().unwrap()
     }
 
     /// Get the device's Bluetooth address
-    ///
-    /// # Returns
-    /// The device address as a string
     #[func]
     fn get_address(&self) -> GString {
         self.address.clone()
     }
 
     /// Get the device's name
-    ///
-    /// # Returns
-    /// The device name as a string (may be empty if name is not available)
     #[func]
     fn get_name(&self) -> GString {
         self.name.clone()
     }
 
     /// Discover services on the connected device
-    ///
-    /// This method discovers all GATT services and their characteristics
-    /// on the connected device. The result is communicated through the
-    /// `services_discovered` or `operation_failed` signals.
-    ///
-    /// The device must be connected before calling this method.
     #[func]
     fn discover_services(&mut self) {
         let address = self.address.to_string();
         ble_debug!("Starting service discovery for device: {}", address);
 
-        // Check if connected
         if !*self.is_connected.lock().unwrap() {
             let error = BleError::NotConnected;
             error.log_error();
@@ -256,27 +220,23 @@ impl BleDevice {
         let peripheral = self.peripheral.clone();
         let runtime = self.runtime.clone();
         let services_cache = self.services.clone();
-        let instance_id = self.base().instance_id();
+        let event_tx = self.event_tx.clone();
 
-        // Execute service discovery asynchronously
         runtime.spawn(async move {
-            ble_debug!("About to call peripheral.discover_services() for {}", address);
-            
+            ble_debug!(
+                "About to call peripheral.discover_services() for {}",
+                address
+            );
+
             let result = match peripheral.discover_services().await {
-                Ok(_) => {
-                    Ok(())
-                }
-                Err(e) => {
-                    Err(BleError::ServiceDiscoveryFailed(e.to_string()))
-                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(BleError::ServiceDiscoveryFailed(e.to_string())),
             };
 
-            // Handle result on main thread
             match result {
                 Ok(_) => {
                     ble_debug!("Service discovery successful for device: {}", address);
-                    
-                    // Get all services
+
                     let services = peripheral.services();
                     let mut service_infos = Vec::new();
 
@@ -304,37 +264,29 @@ impl BleDevice {
                         service_infos.len()
                     );
 
-                    // Cache the services
                     *services_cache.lock().unwrap() = service_infos.clone();
 
-                    // Convert to array of dictionaries
-                    let services_array: Array<Dictionary> =
-                        service_infos.iter().map(|s| s.to_dictionary()).collect();
-
-                    // Emit signal on main thread
-                    if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                        obj.call_deferred(
-                            "_on_services_discovered",
-                            &[services_array.to_variant()],
-                        );
-                    } else {
-                        ble_error!("Failed to get device instance for services_discovered callback");
+                    if let Some(tx) = event_tx {
+                        let event = BleDeviceEvent::ServicesDiscovered {
+                            device_address: address,
+                            services: service_infos,
+                        };
+                        if let Ok(tx_guard) = tx.lock() {
+                            let _ = tx_guard.send(event);
+                        }
                     }
                 }
                 Err(error) => {
                     error.log_error();
 
-                    // Call back to main thread to emit signal
-                    if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                        obj.call_deferred(
-                            "_on_operation_failed",
-                            &[
-                                GString::from("discover_services").to_variant(),
-                                error.to_gstring().to_variant(),
-                            ],
-                        );
-                    } else {
-                        ble_error!("Failed to get device instance for error callback");
+                    if let Some(tx) = event_tx {
+                        let event = BleDeviceEvent::ServiceDiscoveryFailed {
+                            device_address: address,
+                            error: error.to_string(),
+                        };
+                        if let Ok(tx_guard) = tx.lock() {
+                            let _ = tx_guard.send(event);
+                        }
                     }
                 }
             }
@@ -342,31 +294,13 @@ impl BleDevice {
     }
 
     /// Get the list of discovered services
-    ///
-    /// Returns an array of service dictionaries. Each dictionary contains:
-    /// - uuid: String - The service UUID
-    /// - characteristics: Array - Array of characteristic dictionaries
-    ///
-    /// # Returns
-    /// Array of service dictionaries
     #[func]
-    fn get_services(&self) -> Array<Dictionary> {
+    fn get_services(&self) -> Array<VarDictionary> {
         let services = self.services.lock().unwrap();
         services.iter().map(|s| s.to_dictionary()).collect()
     }
 
     /// Read a characteristic value
-    ///
-    /// This method reads data from a characteristic identified by its service
-    /// and characteristic UUIDs. The result is communicated through the
-    /// `characteristic_read` or `operation_failed` signals.
-    ///
-    /// The device must be connected and services must be discovered before
-    /// calling this method.
-    ///
-    /// # Parameters
-    /// * service_uuid: String - UUID of the service containing the characteristic
-    /// * char_uuid: String - UUID of the characteristic to read
     #[func]
     fn read_characteristic(&mut self, service_uuid: GString, char_uuid: GString) {
         ble_debug!(
@@ -375,9 +309,7 @@ impl BleDevice {
             service_uuid
         );
 
-        // Check if connected
-        if !*self.is_connected.lock().unwrap() {
-            let error = BleError::NotConnected;
+        if let Err(error) = self.check_connected() {
             error.log_error();
             self.base_mut().emit_signal(
                 "operation_failed",
@@ -389,114 +321,65 @@ impl BleDevice {
             return;
         }
 
-        let peripheral = self.peripheral.clone();
-        let runtime = self.runtime.clone();
-        let instance_id = self.base().instance_id();
         let service_uuid_str = service_uuid.to_string();
         let char_uuid_str = char_uuid.to_string();
 
-        // Find the characteristic first (synchronous)
-        let characteristics = peripheral.characteristics();
-        let characteristic = characteristics.iter().find(|c| {
-            c.uuid.to_string().eq_ignore_ascii_case(&char_uuid_str)
-                && c.service_uuid
-                    .to_string()
-                    .eq_ignore_ascii_case(&service_uuid_str)
-        });
-
-        match characteristic {
+        match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, reading value", char_uuid_str);
-                let char_clone = char.clone();
-                
-                // Execute read asynchronously
+
+                let peripheral = self.peripheral.clone();
+                let runtime = self.runtime.clone();
+                let address = self.address.to_string();
+                let char_uuid_for_async = char_uuid_str.clone();
+                let event_tx = self.event_tx.clone();
+
                 runtime.spawn(async move {
-                    let result = peripheral.read(&char_clone).await;
+                    let result = peripheral.read(&char).await;
 
                     match result {
                         Ok(data) => {
                             ble_info!(
                                 "Successfully read {} bytes from characteristic {}",
                                 data.len(),
-                                char_uuid_str
+                                char_uuid_for_async
                             );
                             ble_debug!("Read data: {:?}", data);
 
-                            // Convert Vec<u8> to PackedByteArray
-                            let packed_data = PackedByteArray::from(&data[..]);
-
-                            // Call back to main thread to emit signal
-                            if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
-                            {
-                                obj.call_deferred(
-                                    "_on_characteristic_read",
-                                    &[
-                                        GString::from(&char_uuid_str).to_variant(),
-                                        packed_data.to_variant(),
-                                    ],
-                                );
-                            } else {
-                                ble_error!("Failed to get device instance for read callback");
-                            }
+                            let event = BleDeviceEvent::CharacteristicRead {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                data,
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                         Err(e) => {
                             let error = BleError::ReadFailed(e.to_string());
                             error.log_error();
 
-                            // Call back to main thread to emit signal
-                            if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
-                            {
-                                obj.call_deferred(
-                                    "_on_operation_failed",
-                                    &[
-                                        GString::from("read_characteristic").to_variant(),
-                                        error.to_gstring().to_variant(),
-                                    ],
-                                );
-                            } else {
-                                ble_error!("Failed to get device instance for error callback");
-                            }
+                            let event = BleDeviceEvent::CharacteristicReadFailed {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                error: error.to_string(),
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                     }
                 });
             }
             None => {
-                let error = BleError::CharacteristicNotFound(format!(
-                    "{} in service {}",
-                    char_uuid_str, service_uuid_str
-                ));
-                error.log_error();
-
-                // Call back to main thread to emit signal
-                if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                    obj.call_deferred(
-                        "_on_operation_failed",
-                        &[
-                            GString::from("read_characteristic").to_variant(),
-                            error.to_gstring().to_variant(),
-                        ],
-                    );
-                } else {
-                    ble_error!("Failed to get device instance for error callback");
-                }
+                Self::send_char_not_found_event(
+                    &self.event_tx,
+                    self.address.to_string(),
+                    char_uuid_str,
+                    &service_uuid_str,
+                    CharEventKind::Read,
+                );
             }
         }
     }
 
     /// Write data to a characteristic
-    ///
-    /// This method writes data to a characteristic identified by its service
-    /// and characteristic UUIDs. The result is communicated through the
-    /// `characteristic_written` or `operation_failed` signals.
-    ///
-    /// The device must be connected and services must be discovered before
-    /// calling this method.
-    ///
-    /// # Parameters
-    /// * service_uuid: String - UUID of the service containing the characteristic
-    /// * char_uuid: String - UUID of the characteristic to write
-    /// * data: PackedByteArray - Data to write to the characteristic
-    /// * with_response: bool - If true, wait for write response; if false, write without response
     #[func]
     fn write_characteristic(
         &mut self,
@@ -505,7 +388,11 @@ impl BleDevice {
         data: PackedByteArray,
         with_response: bool,
     ) {
-        let write_mode = if with_response { "with response" } else { "without response" };
+        let write_mode = if with_response {
+            "with response"
+        } else {
+            "without response"
+        };
         ble_debug!(
             "Writing {} bytes to characteristic {} ({}) from service {}",
             data.len(),
@@ -514,9 +401,7 @@ impl BleDevice {
             service_uuid
         );
 
-        // Check if connected
-        if !*self.is_connected.lock().unwrap() {
-            let error = BleError::NotConnected;
+        if let Err(error) = self.check_connected() {
             error.log_error();
             self.base_mut().emit_signal(
                 "operation_failed",
@@ -528,41 +413,30 @@ impl BleDevice {
             return;
         }
 
-        let peripheral = self.peripheral.clone();
-        let runtime = self.runtime.clone();
-        let instance_id = self.base().instance_id();
         let service_uuid_str = service_uuid.to_string();
         let char_uuid_str = char_uuid.to_string();
 
-        // Convert PackedByteArray to Vec<u8>
-        let data_vec: Vec<u8> = data.to_vec();
-        let data_len = data_vec.len();
-
-        // Find the characteristic first (synchronous)
-        let characteristics = peripheral.characteristics();
-        let characteristic = characteristics.iter().find(|c| {
-            c.uuid.to_string().eq_ignore_ascii_case(&char_uuid_str)
-                && c.service_uuid
-                    .to_string()
-                    .eq_ignore_ascii_case(&service_uuid_str)
-        });
-
-        match characteristic {
+        match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, writing data", char_uuid_str);
-                ble_debug!("Write data: {:?}", data_vec);
-                let char_clone = char.clone();
+                ble_debug!("Write data: {:?}", data.to_vec());
 
-                // Execute write asynchronously
+                let peripheral = self.peripheral.clone();
+                let runtime = self.runtime.clone();
+                let address = self.address.to_string();
+                let char_uuid_for_async = char_uuid_str.clone();
+                let event_tx = self.event_tx.clone();
+                let data_vec: Vec<u8> = data.to_vec();
+                let data_len = data_vec.len();
+
                 runtime.spawn(async move {
-                    // Choose write method based on with_response parameter
                     let result = if with_response {
                         peripheral
-                            .write(&char_clone, &data_vec, WriteType::WithResponse)
+                            .write(&char, &data_vec, WriteType::WithResponse)
                             .await
                     } else {
                         peripheral
-                            .write(&char_clone, &data_vec, WriteType::WithoutResponse)
+                            .write(&char, &data_vec, WriteType::WithoutResponse)
                             .await
                     };
 
@@ -571,128 +445,42 @@ impl BleDevice {
                             ble_info!(
                                 "Successfully wrote {} bytes to characteristic {}",
                                 data_len,
-                                char_uuid_str
+                                char_uuid_for_async
                             );
 
-                            // Call back to main thread to emit signal
-                            if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
-                            {
-                                obj.call_deferred(
-                                    "_on_characteristic_written",
-                                    &[GString::from(&char_uuid_str).to_variant()],
-                                );
-                            } else {
-                                ble_error!("Failed to get device instance for write callback");
-                            }
+                            let event = BleDeviceEvent::CharacteristicWritten {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                         Err(e) => {
                             let error = BleError::WriteFailed(e.to_string());
                             error.log_error();
 
-                            // Call back to main thread to emit signal
-                            if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
-                            {
-                                obj.call_deferred(
-                                    "_on_operation_failed",
-                                    &[
-                                        GString::from("write_characteristic").to_variant(),
-                                        error.to_gstring().to_variant(),
-                                    ],
-                                );
-                            } else {
-                                ble_error!("Failed to get device instance for error callback");
-                            }
+                            let event = BleDeviceEvent::CharacteristicWriteFailed {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                error: error.to_string(),
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                     }
                 });
             }
             None => {
-                let error = BleError::CharacteristicNotFound(format!(
-                    "{} in service {}",
-                    char_uuid_str, service_uuid_str
-                ));
-                error.log_error();
-
-                // Call back to main thread to emit signal
-                if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                    obj.call_deferred(
-                        "_on_operation_failed",
-                        &[
-                            GString::from("write_characteristic").to_variant(),
-                            error.to_gstring().to_variant(),
-                        ],
-                    );
-                } else {
-                    ble_error!("Failed to get device instance for error callback");
-                }
+                Self::send_char_not_found_event(
+                    &self.event_tx,
+                    self.address.to_string(),
+                    char_uuid_str,
+                    &service_uuid_str,
+                    CharEventKind::Write,
+                );
             }
         }
     }
 
-    // Internal callback methods called from async tasks
-
-    #[func]
-    fn _on_connect_success(&mut self) {
-        self.base_mut().emit_signal("connected", &[]);
-    }
-
-    #[func]
-    fn _on_connect_failed(&mut self, error: GString) {
-        self.base_mut()
-            .emit_signal("connection_failed", &[error.to_variant()]);
-    }
-
-    #[func]
-    fn _on_services_discovered(&mut self, services: Array<Dictionary>) {
-        self.base_mut()
-            .emit_signal("services_discovered", &[services.to_variant()]);
-    }
-
-    #[func]
-    fn _on_operation_failed(&mut self, operation: GString, error: GString) {
-        self.base_mut().emit_signal(
-            "operation_failed",
-            &[operation.to_variant(), error.to_variant()],
-        );
-    }
-
-    #[func]
-    fn _on_characteristic_read(&mut self, char_uuid: GString, data: PackedByteArray) {
-        self.base_mut().emit_signal(
-            "characteristic_read",
-            &[char_uuid.to_variant(), data.to_variant()],
-        );
-    }
-
-    #[func]
-    fn _on_characteristic_written(&mut self, char_uuid: GString) {
-        self.base_mut()
-            .emit_signal("characteristic_written", &[char_uuid.to_variant()]);
-    }
-
-    #[func]
-    fn _on_characteristic_notified(&mut self, char_uuid: GString, data: PackedByteArray) {
-        self.base_mut().emit_signal(
-            "characteristic_notified",
-            &[char_uuid.to_variant(), data.to_variant()],
-        );
-    }
-
     /// Subscribe to characteristic notifications
-    ///
-    /// This method subscribes to notifications from a characteristic identified
-    /// by its service and characteristic UUIDs. When notifications are received,
-    /// they are delivered through the `characteristic_notified` signal.
-    ///
-    /// The device must be connected and services must be discovered before
-    /// calling this method. The characteristic must support notifications or
-    /// indications.
-    ///
-    /// Multiple characteristics can be subscribed simultaneously.
-    ///
-    /// # Parameters
-    /// * service_uuid: String - UUID of the service containing the characteristic
-    /// * char_uuid: String - UUID of the characteristic to subscribe to
     #[func]
     fn subscribe_characteristic(&mut self, service_uuid: GString, char_uuid: GString) {
         ble_debug!(
@@ -701,9 +489,7 @@ impl BleDevice {
             service_uuid
         );
 
-        // Check if connected
-        if !*self.is_connected.lock().unwrap() {
-            let error = BleError::NotConnected;
+        if let Err(error) = self.check_connected() {
             error.log_error();
             self.base_mut().emit_signal(
                 "operation_failed",
@@ -715,56 +501,69 @@ impl BleDevice {
             return;
         }
 
-        let peripheral = self.peripheral.clone();
-        let runtime = self.runtime.clone();
-        let instance_id = self.base().instance_id();
         let service_uuid_str = service_uuid.to_string();
         let char_uuid_str = char_uuid.to_string();
-        let subscribed_chars = self.subscribed_characteristics.clone();
+        let char_uuid_lower = char_uuid_str.to_lowercase();
 
-        // Find the characteristic first (synchronous)
-        let characteristics = peripheral.characteristics();
-        let characteristic = characteristics.iter().find(|c| {
-            c.uuid.to_string().eq_ignore_ascii_case(&char_uuid_str)
-                && c.service_uuid
-                    .to_string()
-                    .eq_ignore_ascii_case(&service_uuid_str)
-        });
+        if self
+            .subscribed_characteristics
+            .lock()
+            .unwrap()
+            .contains(&char_uuid_lower)
+        {
+            ble_warn!(
+                "Already subscribed to characteristic {}, ignoring",
+                char_uuid_str
+            );
+            return;
+        }
 
-        match characteristic {
+        match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, subscribing", char_uuid_str);
-                let char_clone = char.clone();
-                
-                // Execute subscribe asynchronously
+
+                let peripheral = self.peripheral.clone();
+                let runtime = self.runtime.clone();
+                let address = self.address.to_string();
+                let char_uuid_for_async = char_uuid_str.clone();
+                let char_uuid_lower_for_task = char_uuid_lower.clone();
+                let event_tx = self.event_tx.clone();
+                let subscribed_chars = self.subscribed_characteristics.clone();
+                let notification_tasks = self.notification_tasks.clone();
+
                 runtime.spawn(async move {
-                    let result = peripheral.subscribe(&char_clone).await;
+                    let result = peripheral.subscribe(&char).await;
 
                     match result {
                         Ok(_) => {
-                            // Add to subscribed set
                             subscribed_chars
                                 .lock()
                                 .unwrap()
-                                .insert(char_uuid_str.to_lowercase());
+                                .insert(char_uuid_lower.clone());
 
-                            // ble_info!(
-                            //     "Successfully subscribed to characteristic {}",
-                            //     char_uuid_str
-                            // );
+                            let event = BleDeviceEvent::SubscribeSuccess {
+                                device_address: address.clone(),
+                                char_uuid: char_uuid_for_async.clone(),
+                            };
+                            Self::send_event_via(&event_tx, event);
 
-                            // Set up notification handler
                             let peripheral_clone = peripheral.clone();
-                            let char_uuid_for_handler = char_uuid_str.clone();
+                            let char_uuid_for_handler = char_uuid_for_async.clone();
+                            let event_tx_for_handler = event_tx.clone();
+                            let address_for_handler = address.clone();
+                            let char_uuid_lower_for_insert = char_uuid_lower_for_task.clone();
 
-                            tokio::spawn(async move {
-                                ble_debug!("Starting notification handler for {}", char_uuid_for_handler);
-                                let mut notification_stream = peripheral_clone.notifications().await;
+                            let handle = tokio::spawn(async move {
+                                ble_debug!(
+                                    "Starting notification handler for {}",
+                                    char_uuid_for_handler
+                                );
+                                let mut notification_stream =
+                                    peripheral_clone.notifications().await;
 
                                 if let Ok(stream) = notification_stream.as_mut() {
                                     use futures::StreamExt;
                                     while let Some(notification) = stream.next().await {
-                                        // Check if this notification is for our characteristic
                                         if notification
                                             .uuid
                                             .to_string()
@@ -776,87 +575,58 @@ impl BleDevice {
                                                 notification.value.len()
                                             );
 
-                                            let packed_data =
-                                                PackedByteArray::from(&notification.value[..]);
-
-                                            // Call back to main thread to emit signal
-                                            if let Ok(mut obj) =
-                                                Gd::<BleDevice>::try_from_instance_id(instance_id)
-                                            {
-                                                obj.call_deferred(
-                                                    "_on_characteristic_notified",
-                                                    &[
-                                                        GString::from(&char_uuid_for_handler)
-                                                            .to_variant(),
-                                                        packed_data.to_variant(),
-                                                    ],
-                                                );
-                                            } else {
-                                                ble_error!("Failed to get device instance for notification callback");
-                                            }
+                                            let event = BleDeviceEvent::CharacteristicNotified {
+                                                device_address: address_for_handler.clone(),
+                                                char_uuid: char_uuid_for_handler.clone(),
+                                                data: notification.value,
+                                            };
+                                            Self::send_event_via(&event_tx_for_handler, event);
                                         }
                                     }
-                                    ble_debug!("Notification stream ended for {}", char_uuid_for_handler);
+                                    ble_debug!(
+                                        "Notification stream ended for {}",
+                                        char_uuid_for_handler
+                                    );
                                 } else {
-                                    ble_error!("Failed to get notification stream for {}", char_uuid_for_handler);
+                                    ble_error!(
+                                        "Failed to get notification stream for {}",
+                                        char_uuid_for_handler
+                                    );
                                 }
                             });
+
+                            notification_tasks
+                                .lock()
+                                .unwrap()
+                                .insert(char_uuid_lower_for_insert, handle);
                         }
                         Err(e) => {
                             let error = BleError::SubscribeFailed(e.to_string());
                             error.log_error();
 
-                            // Call back to main thread to emit signal
-                            if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
-                            {
-                                obj.call_deferred(
-                                    "_on_operation_failed",
-                                    &[
-                                        GString::from("subscribe_characteristic").to_variant(),
-                                        error.to_gstring().to_variant(),
-                                    ],
-                                );
-                            } else {
-                                ble_error!("Failed to get device instance for error callback");
-                            }
+                            let event = BleDeviceEvent::SubscribeFailed {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                error: error.to_string(),
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                     }
                 });
             }
             None => {
-                let error = BleError::CharacteristicNotFound(format!(
-                    "{} in service {}",
-                    char_uuid_str, service_uuid_str
-                ));
-                error.log_error();
-
-                // Call back to main thread to emit signal
-                if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                    obj.call_deferred(
-                        "_on_operation_failed",
-                        &[
-                            GString::from("subscribe_characteristic").to_variant(),
-                            error.to_gstring().to_variant(),
-                        ],
-                    );
-                } else {
-                    ble_error!("Failed to get device instance for error callback");
-                }
+                Self::send_char_not_found_event(
+                    &self.event_tx,
+                    self.address.to_string(),
+                    char_uuid_str,
+                    &service_uuid_str,
+                    CharEventKind::Subscribe,
+                );
             }
         }
     }
 
     /// Unsubscribe from characteristic notifications
-    ///
-    /// This method unsubscribes from notifications for a characteristic
-    /// identified by its service and characteristic UUIDs. After unsubscribing,
-    /// no more notifications will be received for this characteristic.
-    ///
-    /// The device must be connected before calling this method.
-    ///
-    /// # Parameters
-    /// * service_uuid: String - UUID of the service containing the characteristic
-    /// * char_uuid: String - UUID of the characteristic to unsubscribe from
     #[func]
     fn unsubscribe_characteristic(&mut self, service_uuid: GString, char_uuid: GString) {
         ble_debug!(
@@ -865,9 +635,7 @@ impl BleDevice {
             service_uuid
         );
 
-        // Check if connected
-        if !*self.is_connected.lock().unwrap() {
-            let error = BleError::NotConnected;
+        if let Err(error) = self.check_connected() {
             error.log_error();
             self.base_mut().emit_signal(
                 "operation_failed",
@@ -879,84 +647,76 @@ impl BleDevice {
             return;
         }
 
-        let peripheral = self.peripheral.clone();
-        let runtime = self.runtime.clone();
-        let instance_id = self.base().instance_id();
+        // Abort notification task first
+        let char_uuid_lower = char_uuid.to_string().to_lowercase();
+        if let Some(handle) = self
+            .notification_tasks
+            .lock()
+            .unwrap()
+            .remove(&char_uuid_lower)
+        {
+            handle.abort();
+            ble_debug!("Aborted notification task for {}", char_uuid_lower);
+        }
+
         let service_uuid_str = service_uuid.to_string();
         let char_uuid_str = char_uuid.to_string();
-        let subscribed_chars = self.subscribed_characteristics.clone();
 
-        // Find the characteristic first (synchronous)
-        let characteristics = peripheral.characteristics();
-        let characteristic = characteristics.iter().find(|c| {
-            c.uuid.to_string().eq_ignore_ascii_case(&char_uuid_str)
-                && c.service_uuid
-                    .to_string()
-                    .eq_ignore_ascii_case(&service_uuid_str)
-        });
-
-        match characteristic {
+        match self.find_characteristic(&service_uuid_str, &char_uuid_str) {
             Some(char) => {
                 ble_debug!("Found characteristic {}, unsubscribing", char_uuid_str);
-                let char_clone = char.clone();
-                
-                // Execute unsubscribe asynchronously
+
+                let peripheral = self.peripheral.clone();
+                let runtime = self.runtime.clone();
+                let address = self.address.to_string();
+                let char_uuid_for_async = char_uuid_str.clone();
+                let char_uuid_lower_for_remove = char_uuid_lower.clone();
+                let event_tx = self.event_tx.clone();
+                let subscribed_chars = self.subscribed_characteristics.clone();
+
                 runtime.spawn(async move {
-                    let result = peripheral.unsubscribe(&char_clone).await;
+                    let result = peripheral.unsubscribe(&char).await;
 
                     match result {
                         Ok(_) => {
-                            // Remove from subscribed set
                             subscribed_chars
                                 .lock()
                                 .unwrap()
-                                .remove(&char_uuid_str.to_lowercase());
+                                .remove(&char_uuid_lower_for_remove);
 
                             ble_info!(
                                 "Successfully unsubscribed from characteristic {}",
-                                char_uuid_str
+                                char_uuid_for_async
                             );
+
+                            let event = BleDeviceEvent::UnsubscribeSuccess {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                         Err(e) => {
                             let error = BleError::UnsubscribeFailed(e.to_string());
                             error.log_error();
 
-                            // Call back to main thread to emit signal
-                            if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id)
-                            {
-                                obj.call_deferred(
-                                    "_on_operation_failed",
-                                    &[
-                                        GString::from("unsubscribe_characteristic").to_variant(),
-                                        error.to_gstring().to_variant(),
-                                    ],
-                                );
-                            } else {
-                                ble_error!("Failed to get device instance for error callback");
-                            }
+                            let event = BleDeviceEvent::UnsubscribeFailed {
+                                device_address: address,
+                                char_uuid: char_uuid_for_async,
+                                error: error.to_string(),
+                            };
+                            Self::send_event_via(&event_tx, event);
                         }
                     }
                 });
             }
             None => {
-                let error = BleError::CharacteristicNotFound(format!(
-                    "{} in service {}",
-                    char_uuid_str, service_uuid_str
-                ));
-                error.log_error();
-
-                // Call back to main thread to emit signal
-                if let Ok(mut obj) = Gd::<BleDevice>::try_from_instance_id(instance_id) {
-                    obj.call_deferred(
-                        "_on_operation_failed",
-                        &[
-                            GString::from("unsubscribe_characteristic").to_variant(),
-                            error.to_gstring().to_variant(),
-                        ],
-                    );
-                } else {
-                    ble_error!("Failed to get device instance for error callback");
-                }
+                Self::send_char_not_found_event(
+                    &self.event_tx,
+                    self.address.to_string(),
+                    char_uuid_str,
+                    &service_uuid_str,
+                    CharEventKind::Unsubscribe,
+                );
             }
         }
     }
@@ -964,48 +724,36 @@ impl BleDevice {
 
 #[godot_api]
 impl IRefCounted for BleDevice {
-    /// Initialize the BleDevice
-    ///
-    /// Note: This is called by Godot when the object is created.
-    /// Use the `new` method to create instances from Rust code.
     fn init(_base: Base<RefCounted>) -> Self {
-        // This should not be called directly - use new() instead
-        // We panic here because BleDevice must be created through the new() method
         panic!("BleDevice::init called directly - use BleDevice::new() instead");
     }
 }
 
-/// Implement Drop trait to handle cleanup when the device is destroyed
 impl Drop for BleDevice {
     fn drop(&mut self) {
-        ble_info!("BleDevice: Cleaning up resources for device {}", self.address);
+        ble_info!(
+            "BleDevice: Cleaning up resources for device {}",
+            self.address
+        );
         self.cleanup();
     }
 }
 
 impl BleDevice {
-    /// Create a new BleDevice instance
-    ///
-    /// This is the proper way to create a BleDevice from Rust code.
-    ///
-    /// # Parameters
-    /// * peripheral: The btleplug Peripheral to wrap
-    /// * runtime: The Tokio runtime to use for async operations
-    ///
-    /// # Returns
-    /// A new Gd<BleDevice> instance
-    pub fn new(peripheral: Peripheral, runtime: Arc<Runtime>) -> Gd<Self> {
-        // On macOS, use UUID as address since MAC address is not exposed
+    pub fn new(
+        peripheral: Peripheral,
+        runtime: Arc<Runtime>,
+        event_tx: Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>,
+    ) -> Gd<Self> {
         let address = peripheral.id().to_string();
-        
-        // Get device properties
+
         let properties = runtime.block_on(async { peripheral.properties().await });
 
         let name = match properties {
             Ok(Some(props)) => props.local_name.unwrap_or_default(),
             Ok(None) => String::new(),
             Err(e) => {
-                godot_warn!("Failed to get device properties: {}", e);
+                ble_warn!("Failed to get device properties: {}", e);
                 String::new()
             }
         };
@@ -1019,10 +767,79 @@ impl BleDevice {
             is_connected: Arc::new(Mutex::new(false)),
             services: Arc::new(Mutex::new(Vec::new())),
             subscribed_characteristics: Arc::new(Mutex::new(HashSet::new())),
+            notification_tasks: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: Some(event_tx),
         })
     }
 
-    /// Convert a btleplug characteristic to BleCharacteristicInfo
+    fn check_connected(&self) -> Result<(), BleError> {
+        if *self.is_connected.lock().unwrap() {
+            Ok(())
+        } else {
+            Err(BleError::NotConnected)
+        }
+    }
+
+    fn find_characteristic(&self, service_uuid: &str, char_uuid: &str) -> Option<Characteristic> {
+        let characteristics = self.peripheral.characteristics();
+        characteristics
+            .iter()
+            .find(|c| {
+                c.uuid.to_string().eq_ignore_ascii_case(char_uuid)
+                    && c.service_uuid
+                        .to_string()
+                        .eq_ignore_ascii_case(service_uuid)
+            })
+            .cloned()
+    }
+
+    fn send_event_via(
+        tx: &Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>,
+        event: BleDeviceEvent,
+    ) {
+        if let Some(tx) = tx {
+            if let Ok(tx_guard) = tx.lock() {
+                let _ = tx_guard.send(event);
+            }
+        }
+    }
+
+    fn send_char_not_found_event(
+        tx: &Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>,
+        device_address: String,
+        char_uuid: String,
+        service_uuid: &str,
+        event_type: CharEventKind,
+    ) {
+        let error =
+            BleError::CharacteristicNotFound(format!("{} in service {}", char_uuid, service_uuid));
+        error.log_error();
+
+        let event = match event_type {
+            CharEventKind::Read => BleDeviceEvent::CharacteristicReadFailed {
+                device_address,
+                char_uuid,
+                error: error.to_string(),
+            },
+            CharEventKind::Write => BleDeviceEvent::CharacteristicWriteFailed {
+                device_address,
+                char_uuid,
+                error: error.to_string(),
+            },
+            CharEventKind::Subscribe => BleDeviceEvent::SubscribeFailed {
+                device_address,
+                char_uuid,
+                error: error.to_string(),
+            },
+            CharEventKind::Unsubscribe => BleDeviceEvent::UnsubscribeFailed {
+                device_address,
+                char_uuid,
+                error: error.to_string(),
+            },
+        };
+        Self::send_event_via(tx, event);
+    }
+
     fn convert_characteristic(characteristic: &Characteristic) -> BleCharacteristicInfo {
         let props = CharacteristicProperties {
             read: characteristic.properties.contains(CharPropFlags::READ),
@@ -1036,86 +853,53 @@ impl BleDevice {
         BleCharacteristicInfo::new(characteristic.uuid.to_string(), props)
     }
 
-    /// Clean up resources when the device is destroyed
-    ///
-    /// This method is called automatically when the device object is about to be destroyed.
-    /// It ensures proper cleanup of all subscriptions and disconnects the device.
     fn cleanup(&mut self) {
         let address = self.address.to_string();
         ble_debug!("Starting cleanup for device: {}", address);
 
-        // Check if device is connected
+        // Abort all notification tasks
+        let notification_tasks = self.notification_tasks.lock().unwrap();
+        let task_count = notification_tasks.len();
+        if task_count > 0 {
+            ble_debug!("Aborting {} notification tasks", task_count);
+            for (char_uuid, handle) in notification_tasks.iter() {
+                handle.abort();
+                ble_debug!("Aborted notification task for {}", char_uuid);
+            }
+        }
+        drop(notification_tasks);
+        self.notification_tasks.lock().unwrap().clear();
+
         let is_connected = *self.is_connected.lock().unwrap();
-        
+
         if is_connected {
             ble_debug!("Device {} is connected, initiating disconnect", address);
-            
-            // Get subscription count before clearing
+
             let sub_count = self.subscribed_characteristics.lock().unwrap().len();
             if sub_count > 0 {
-                ble_debug!("Clearing {} active subscriptions", sub_count);
+                ble_debug!("Device has {} active subscriptions", sub_count);
             }
 
-            // Unsubscribe from all characteristics
-            let subscribed_uuids: Vec<String> = self
-                .subscribed_characteristics
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect();
-
             let peripheral = self.peripheral.clone();
-            let runtime = self.runtime.clone();
+            let is_connected_clone = self.is_connected.clone();
             let subscribed_chars = self.subscribed_characteristics.clone();
-            let address_clone = address.clone();
 
-            // Perform cleanup in async context
-            runtime.spawn(async move {
-                // Unsubscribe from all characteristics
-                if !subscribed_uuids.is_empty() {
-                    ble_debug!("Unsubscribing from {} characteristics", subscribed_uuids.len());
-                    let characteristics = peripheral.characteristics();
-                    
-                    for uuid in &subscribed_uuids {
-                        if let Some(char) = characteristics.iter().find(|c| {
-                            c.uuid.to_string().eq_ignore_ascii_case(uuid)
-                        }) {
-                            match peripheral.unsubscribe(char).await {
-                                Ok(_) => {
-                                    ble_debug!("Unsubscribed from characteristic {}", uuid);
-                                }
-                                Err(e) => {
-                                    ble_debug!("Failed to unsubscribe from {}: {}", uuid, e);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Clear the subscribed set
-                subscribed_chars.lock().unwrap().clear();
-
-                // Disconnect the device
+            self.runtime.spawn(async move {
                 match peripheral.disconnect().await {
                     Ok(_) => {
-                        ble_info!("Device {} disconnected during cleanup", address_clone);
+                        ble_info!("Device {} disconnected during cleanup", address);
                     }
                     Err(e) => {
-                        ble_debug!("Disconnect during cleanup failed for {}: {}", address_clone, e);
+                        ble_warn!(
+                            "Error disconnecting device {} during cleanup: {}",
+                            address,
+                            e
+                        );
                     }
                 }
+                *is_connected_clone.lock().unwrap() = false;
+                subscribed_chars.lock().unwrap().clear();
             });
-
-            // Mark as disconnected immediately
-            *self.is_connected.lock().unwrap() = false;
-        } else {
-            ble_debug!("Device {} already disconnected, skipping cleanup", address);
         }
-
-        // Clear services cache
-        self.services.lock().unwrap().clear();
-        
-        ble_info!("Cleanup complete for device: {}", address);
     }
 }

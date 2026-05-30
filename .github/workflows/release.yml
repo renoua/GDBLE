@@ -136,7 +136,7 @@ jobs:
           # Rename and copy with platform and architecture suffix
           case "${{ matrix.platform }}" in
             windows)
-              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/gdble.windows.x86_64.dll
+              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble.windows.x86_64.dll
               ;;
             macos)
               cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble.macos.x86_64.dylib
@@ -186,8 +186,8 @@ jobs:
           cp demo/addons/gdble/gdble.gdextension release/addons/gdble/
           
           # Copy Windows binary
-          if [ -f artifacts/gdble-windows/gdble.windows.x86_64.dll ]; then
-            cp artifacts/gdble-windows/gdble.windows.x86_64.dll release/addons/gdble/gdble.windows.x86_64.dll
+          if [ -f artifacts/gdble-windows/libgdble.windows.x86_64.dll ]; then
+            cp artifacts/gdble-windows/libgdble.windows.x86_64.dll release/addons/gdble/libgdble.windows.x86_64.dll
           fi
 
           # Copy macOS x86_64 binary
@@ -280,8 +280,8 @@ jobs:
           fi
           
           # Copy Windows binary
-          if [ -f artifacts/gdble-windows/gdble.windows.x86_64.dll ]; then
-            cp artifacts/gdble-windows/gdble.windows.x86_64.dll addons/gdble/gdble.windows.x86_64.dll
+          if [ -f artifacts/gdble-windows/libgdble.windows.x86_64.dll ]; then
+            cp artifacts/gdble-windows/libgdble.windows.x86_64.dll addons/gdble/libgdble.windows.x86_64.dll
             echo "✓ Updated Windows binary"
           fi
           
@@ -366,21 +366,58 @@ jobs:
           body: |
             # GDBLE ${{ steps.get_version.outputs.version }}
             
-            ## 🆕 What's Updated in This Release
+            ## Highlights
             
-            - **Linux Support**: Added Linux platform build support (x86_64)
+            - Updated the Rust dependency stack for the 0.5.5 release:
+              - `godot` 0.5.2
+              - `btleplug` 0.12.0
+              - `tokio` 1.52.1
+              - `futures` 0.3.32
+            - Fixed compatibility with `godot-rust` 0.5.2 dictionary APIs by passing `Variant`, `Array`, `Dictionary`, and `PackedByteArray` values through the required reference-based `AsArg` path.
+            - Kept the public GDScript API compatible with the 0.5.x line.
+            - Refreshed Android documentation to match the currently packaged architectures.
             
-            This release enables GDBLE to run on Linux systems, expanding cross-platform compatibility.
+            ## Fixes
             
-            ## 🌍 Platform Support
+            - Fixed build/test failures caused by `VarDictionary::set()` calls after upgrading the Godot Rust bindings.
+            - Updated generated service, characteristic, device, and adapter dictionaries to work with the current Godot Rust argument passing rules.
+            - Corrected Android docs that still described ARMv7 as a build/test target.
             
-            - ✅ **Windows** 10+ (x86_64)
-            - ✅ **macOS** 10.15+ (x86_64, ARM64)
-            - ✅ **Linux** (x86_64)
-            - ⚠️ **Android** 5.0+ (API 21+, ARM64, x86_64) - Not tested, may not work correctly
+            ## Dependencies
             
-            > ⚠️ **Note**: Android ARMv7 (32-bit) is not supported due to godot-ffi compatibility issues. Please use ARM64 or x86_64 architectures for Android builds.
-            > 
-            > ⚠️ **Important**: Android support in this release has not been tested. While the code compiles successfully, actual functionality on Android devices is not guaranteed. Please test thoroughly before using in production.
+            | Dependency | Version |
+            |------------|---------|
+            | godot | 0.5.2 |
+            | btleplug | 0.12.0 |
+            | tokio | 1.52.1 |
+            | futures | 0.3.32 |
+            
+            ## Platform Support
+            
+            | Platform | Architecture | Status |
+            |----------|--------------|--------|
+            | Windows 10+ | x86_64 | Tested |
+            | macOS 10.15+ | x86_64 | Supported |
+            | macOS 11+ | ARM64 (Apple Silicon) | Supported |
+            | Linux | x86_64 | Supported |
+            | Android 5.0+ | ARM64 | Built, device testing recommended |
+            | Android 5.0+ | x86_64 | Built, device testing recommended |
+
+            > Note: Android ARMv7 (32-bit) is not supported due to godot-ffi compatibility issues.
+            >
+            > Android builds compile successfully, but should be tested on real devices before production use.
+
+            ## Migration from 0.5.x
+            
+            No GDScript API changes are required. Replace the addon files with the new release package and rebuild/export your Godot project.
+            
+            ## Verification
+            
+            - `cargo test -q` passes with 10 tests.
+            
+            ## Known Issues
+            
+            - Android ARMv7 is not supported.
+            - Android binaries still require real-device validation for production projects.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
