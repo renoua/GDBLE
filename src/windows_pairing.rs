@@ -44,7 +44,7 @@ impl PairingResult {
 mod platform {
     use super::{PairingResult, PairingState};
     use std::future::Future;
-    use windows::core::{HSTRING, Result as WinResult};
+    use windows::core::{Result as WinResult, HSTRING};
     use windows::Devices::Bluetooth::BluetoothLEDevice;
     use windows::Devices::Enumeration::{
         DeviceInformation, DevicePairingResultStatus, DeviceUnpairingResultStatus,
@@ -71,11 +71,13 @@ mod platform {
     }
 
     pub fn pair_device(address: &str) -> PairingResult {
-        block_on(pair_device_async(address)).unwrap_or_else(PairingResult::failed)
+        block_on(pair_device_async(address))
+            .unwrap_or_else(|err| PairingResult::failed(err.as_str()))
     }
 
     pub fn unpair_device(address: &str) -> PairingResult {
-        block_on(unpair_device_async(address)).unwrap_or_else(PairingResult::failed)
+        block_on(unpair_device_async(address))
+            .unwrap_or_else(|err| PairingResult::failed(err.as_str()))
     }
 
     async fn pair_device_async(address: &str) -> PairingResult {
