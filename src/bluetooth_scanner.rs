@@ -1,4 +1,4 @@
-use btleplug::api::{Central, CentralEvent, PeripheralProperties, ScanFilter};
+use btleplug::api::{Central, CentralEvent, Peripheral as _, PeripheralProperties, ScanFilter};
 use btleplug::platform::Adapter;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -116,11 +116,9 @@ impl BluetoothScanner {
 
         // Wait for scan duration with additional debugging
         // ble_debug!("Waiting for scan duration: {:?}", scan_duration);
-        let result = timeout(scan_duration, self.collect_devices(device_tx)).await;
-        // ble_debug!("Scan timeout completed, checking result...");
+        let result = timeout(scan_duration, self.collect_devices(device_tx.clone())).await;
 
         // Stop scanning
-        // ble_debug!("Stopping adapter scan");
         let stop_result = self.adapter.stop_scan().await;
 
         // Update scanning state
@@ -140,18 +138,39 @@ impl BluetoothScanner {
             error
         })?;
 
-        match result {
-            Ok(Ok(())) => {
-                // ble_debug!("Scan collection completed successfully");
-                Ok(())
+        // Post-scan pass: re-query all peripherals from the adapter cache.
+        // btleplug 0.12 on Linux may fire ServicesAdvertisement/PropertiesChanged events whose
+        // UUIDs are stored by BlueZ but not forwarded via DeviceUpdated to our event stream.
+        // After stop_scan() the BlueZ cache is authoritative — querying it gives the final,
+        // fully-populated properties (name + service UUIDs) for every device seen during scan.
+        if let Ok(peripherals) = self.adapter.peripherals().await {
+            for peripheral in peripherals {
+                if let Ok(Some(properties)) = peripheral.properties().await {
+                    let address = peripheral.id().to_string();
+                    let device_info = Self::create_device_info(address.clone(), properties).await;
+                    let needs_update = if let Ok(mut devices) = self.discovered_devices.lock() {
+                        let stale = match devices.get(&address) {
+                            Some(old) => old.services.is_empty() && !device_info.services.is_empty(),
+                            // Device not seen via events — add it (e.g. no DeviceDiscovered fired)
+                            None => true,
+                        };
+                        devices.insert(address.clone(), device_info.clone());
+                        stale
+                    } else {
+                        false
+                    };
+                    if needs_update {
+                        let _ = device_tx.send(device_info);
+                    }
+                }
             }
+        }
+
+        match result {
+            Ok(Ok(())) | Err(_) => Ok(()),
             Ok(Err(e)) => {
                 e.log_error();
                 Err(e)
-            }
-            Err(_) => {
-                // ble_debug!("Scan timeout reached (expected)");
-                Ok(())
             }
         }
     }
@@ -270,12 +289,32 @@ impl BluetoothScanner {
                         }
                     }
                 }
-                _ => {
-                    // Only log non-discovery events every 50th time
-                    if event_count % 50 == 0 {
-                        ble_debug!("Other event received: {:?}", event);
+                // btleplug 0.12: service UUIDs can arrive via ServicesAdvertisement
+                // instead of (or in addition to) DeviceUpdated.  Update the stored
+                // device entry so the post-scan peripherals() pass has something to enrich.
+                CentralEvent::ServicesAdvertisement { id, services } => {
+                    if !services.is_empty() {
+                        if let Ok(peripheral) = self.adapter.peripheral(&id).await {
+                            if let Ok(Some(properties)) = peripheral.properties().await {
+                                let address = id.to_string();
+                                let device_info =
+                                    Self::create_device_info(address.clone(), properties).await;
+                                let should_send =
+                                    if let Ok(mut devices) = self.discovered_devices.lock() {
+                                        let exists = devices.contains_key(&address);
+                                        devices.insert(address.clone(), device_info.clone());
+                                        exists
+                                    } else {
+                                        false
+                                    };
+                                if should_send {
+                                    let _ = device_tx.send(device_info);
+                                }
+                            }
+                        }
                     }
                 }
+                _ => {}
             }
         }
 
