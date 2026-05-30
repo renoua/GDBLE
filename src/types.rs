@@ -101,6 +101,29 @@ impl DeviceInfo {
         }
     }
 
+    pub fn with_unknown_pairing(
+        address: String,
+        name: Option<String>,
+        rssi: Option<i16>,
+        services: Vec<String>,
+        manufacturer_data: std::collections::HashMap<u16, Vec<u8>>,
+        service_data: std::collections::HashMap<String, Vec<u8>>,
+        tx_power_level: Option<i16>,
+    ) -> Self {
+        Self::new(
+            address,
+            name,
+            rssi,
+            services,
+            manufacturer_data,
+            service_data,
+            tx_power_level,
+            false,
+            false,
+            "unknown".to_string(),
+        )
+    }
+
     /// 转换为 Godot VarDictionary
     pub fn to_dictionary(&self) -> VarDictionary {
         let mut dict = VarDictionary::new();
@@ -427,3 +450,26 @@ impl AdapterInfo {
 pub use crate::ble_characteristic::{BleCharacteristicInfo, CharacteristicProperties};
 #[allow(unused_imports)]
 pub use crate::ble_service::BleServiceInfo;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn device_info_unknown_pairing_defaults_are_non_blocking_placeholders() {
+        let info = DeviceInfo::with_unknown_pairing(
+            "AA:BB:CC:DD:EE:FF".to_string(),
+            Some("Trainer".to_string()),
+            Some(-42),
+            vec!["1826".to_string()],
+            HashMap::new(),
+            HashMap::new(),
+            None,
+        );
+
+        assert!(!info.paired);
+        assert!(!info.can_pair);
+        assert_eq!(info.pairing_status, "unknown");
+    }
+}

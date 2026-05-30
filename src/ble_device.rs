@@ -743,21 +743,10 @@ impl BleDevice {
     pub fn new(
         peripheral: Peripheral,
         runtime: Arc<Runtime>,
+        address: String,
+        name: String,
         event_tx: Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>,
     ) -> Gd<Self> {
-        let address = peripheral.id().to_string();
-
-        let properties = runtime.block_on(async { peripheral.properties().await });
-
-        let name = match properties {
-            Ok(Some(props)) => props.local_name.unwrap_or_default(),
-            Ok(None) => String::new(),
-            Err(e) => {
-                ble_warn!("Failed to get device properties: {}", e);
-                String::new()
-            }
-        };
-
         Gd::from_init_fn(|base| Self {
             base,
             peripheral: Arc::new(peripheral),

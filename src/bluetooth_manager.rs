@@ -16,6 +16,19 @@ use crate::types::{
 };
 use crate::{ble_debug, ble_error, ble_info, ble_warn};
 
+struct PairingEvent {
+    address: String,
+    success: bool,
+    status: String,
+    state: crate::windows_pairing::PairingState,
+    emit_finished: bool,
+}
+
+enum PairingAction {
+    Pair,
+    Unpair,
+}
+
 /// BluetoothManager is the main entry point for BLE functionality in Godot
 ///
 /// This node manages the Bluetooth adapter, runtime, and coordinates all BLE operations.
@@ -57,6 +70,15 @@ pub struct BluetoothManager {
 
     /// Pending async adapter init result — polled in process()
     init_result: Option<Arc<Mutex<Option<Result<Adapter, BleError>>>>>,
+
+    /// Channel receiver for async pairing state and pair/unpair operations
+    pairing_rx: Option<Arc<Mutex<mpsc::UnboundedReceiver<PairingEvent>>>>,
+
+    /// Channel sender for async pairing state and pair/unpair operations
+    pairing_tx: Option<Arc<Mutex<mpsc::UnboundedSender<PairingEvent>>>>,
+
+    /// Last known native OS pairing states by address
+    pairing_states: Arc<Mutex<HashMap<String, crate::windows_pairing::PairingState>>>,
 }
 
 #[godot_api]
@@ -77,6 +99,9 @@ impl INode for BluetoothManager {
             devices: Arc::new(Mutex::new(HashMap::new())),
             is_initialized: Arc::new(Mutex::new(false)),
             init_result: None,
+            pairing_rx: None,
+            pairing_tx: None,
+            pairing_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -143,8 +168,13 @@ impl INode for BluetoothManager {
         };
         if let Some(result) = init_ready {
             self.init_result = None;
-            eprintln!("[GDBLE] process: init result ready, calling handle_init_result");
+            ble_debug!("process: init result ready, calling handle_init_result");
             self.handle_init_result(result);
+        }
+
+        let pairing_events = self.collect_pairing_events();
+        for event in pairing_events {
+            self.handle_pairing_event(event);
         }
 
         let events = self.collect_device_events();
@@ -299,8 +329,21 @@ impl BluetoothManager {
     /// On Windows this uses WinRT DeviceInformation.Pairing. Other platforms
     /// currently return paired=false and can_pair=false.
     #[func]
-    pub fn get_pairing_state(&self, address: GString) -> VarDictionary {
-        crate::windows_pairing::get_pairing_state(&address.to_string()).to_dictionary()
+    pub fn get_pairing_state(&mut self, address: GString) -> VarDictionary {
+        let address_str = address.to_string();
+        let cached = self
+            .pairing_states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&address_str).cloned());
+
+        if cached.is_none() {
+            self.spawn_pairing_state_refresh(address_str.clone());
+        }
+
+        cached
+            .unwrap_or_else(|| crate::windows_pairing::PairingState::unavailable("unknown"))
+            .to_dictionary()
     }
 
     /// Pair a BLE device through the native OS pairing flow.
@@ -312,16 +355,7 @@ impl BluetoothManager {
             &[GString::from(&address_str).to_variant()],
         );
 
-        let result = crate::windows_pairing::pair_device(&address_str);
-        self.base_mut().emit_signal(
-            "pairing_finished",
-            &[
-                GString::from(&address_str).to_variant(),
-                result.success.to_variant(),
-                GString::from(&result.status).to_variant(),
-            ],
-        );
-        result.success
+        self.spawn_pairing_operation(address_str, PairingAction::Pair)
     }
 
     /// Remove native OS pairing for a BLE device.
@@ -333,16 +367,7 @@ impl BluetoothManager {
             &[GString::from(&address_str).to_variant()],
         );
 
-        let result = crate::windows_pairing::unpair_device(&address_str);
-        self.base_mut().emit_signal(
-            "pairing_finished",
-            &[
-                GString::from(&address_str).to_variant(),
-                result.success.to_variant(),
-                GString::from(&result.status).to_variant(),
-            ],
-        );
-        result.success
+        self.spawn_pairing_operation(address_str, PairingAction::Unpair)
     }
 
     /// Initialize the Bluetooth adapter
@@ -376,23 +401,27 @@ impl BluetoothManager {
         // Spawn adapter acquisition asynchronously — result polled in process()
         // to avoid blocking the Godot main thread (WinRT/BlueZ init can take seconds).
         ble_debug!("Spawning async adapter acquisition");
-        let slot: Arc<Mutex<Option<Result<Adapter, BleError>>>> =
-            Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<Result<Adapter, BleError>>>> = Arc::new(Mutex::new(None));
         let slot_clone = slot.clone();
         if let Some(ref runtime_mgr) = self.runtime {
-            eprintln!("[GDBLE] initialize: spawning async adapter task");
+            ble_debug!("initialize: spawning async adapter task");
             runtime_mgr.spawn(async move {
-                eprintln!("[GDBLE] async init task: started, calling get_adapter_async()...");
+                ble_debug!("async init task: started, calling get_adapter_async()");
                 let result = Self::get_adapter_async().await;
-                eprintln!("[GDBLE] async init task: get_adapter_async() returned -> {}",
-                    result.as_ref().map(|_| "Ok(adapter)").unwrap_or_else(|e| Box::leak(format!("Err({})", e).into_boxed_str())));
+                ble_debug!(
+                    "async init task: get_adapter_async() returned -> {}",
+                    result
+                        .as_ref()
+                        .map(|_| "Ok(adapter)".to_string())
+                        .unwrap_or_else(|e| format!("Err({})", e))
+                );
                 if let Ok(mut guard) = slot_clone.lock() {
                     *guard = Some(result);
                 }
-                eprintln!("[GDBLE] async init task: result stored in slot");
+                ble_debug!("async init task: result stored in slot");
             });
             self.init_result = Some(slot);
-            eprintln!("[GDBLE] initialize: task spawned, returning to Godot");
+            ble_debug!("initialize: task spawned, returning to Godot");
         } else {
             let error = BleError::InitializationFailed("Runtime not created".to_string());
             error.log_error();
@@ -423,6 +452,10 @@ impl BluetoothManager {
                 let (event_tx, event_rx) = mpsc::unbounded_channel::<BleDeviceEvent>();
                 self.device_event_tx = Some(Arc::new(Mutex::new(event_tx)));
                 self.device_event_rx = Some(Arc::new(Mutex::new(event_rx)));
+
+                let (pairing_tx, pairing_rx) = mpsc::unbounded_channel::<PairingEvent>();
+                self.pairing_tx = Some(Arc::new(Mutex::new(pairing_tx)));
+                self.pairing_rx = Some(Arc::new(Mutex::new(pairing_rx)));
 
                 self.set_initialized(true);
                 ble_info!("Bluetooth initialization complete");
@@ -711,53 +744,19 @@ impl BluetoothManager {
             }
         };
 
-        // Find the peripheral from discovered devices
-        let adapter = self.adapter.as_ref()?.clone();
-        let address_clone = address_str.clone();
-
-        ble_debug!("Searching for peripheral with address: {}", address_clone);
-        // Use block_on to find the peripheral.
-        // IMPORTANT: peripheral.id().to_string() is synchronous and gives the MAC address on
-        // Windows/Linux and a UUID on macOS. We match by ID first (no await = no WinRT round-trip)
-        // and only fall back to properties().await for macOS UUID-based addressing.
-        let peripheral_result = runtime.block_on(async move {
-            use btleplug::api::{Central, Peripheral as _};
-
-            let peripherals = adapter.peripherals().await.ok()?;
-            ble_debug!("Found {} total peripherals", peripherals.len());
-
-            // Pass 1: match by peripheral ID — synchronous, no WinRT/D-Bus round-trip.
-            // On Windows and Linux this IS the MAC address; on macOS it is a UUID.
-            for peripheral in &peripherals {
-                if peripheral.id().to_string().eq_ignore_ascii_case(&address_clone) {
-                    ble_debug!("Found peripheral by ID: {}", address_clone);
-                    return Some(peripheral.clone());
-                }
-            }
-
-            // Pass 2: fallback — match by MAC address from properties (macOS UUID addressing).
-            for peripheral in peripherals {
-                if let Ok(Some(props)) = peripheral.properties().await {
-                    let addr = props.address.to_string();
-                    if !addr.eq_ignore_ascii_case("00:00:00:00:00:00")
-                        && addr.eq_ignore_ascii_case(&address_clone)
-                    {
-                        ble_debug!("Found peripheral by MAC (props fallback): {}", addr);
-                        return Some(peripheral);
-                    }
-                }
-            }
-
-            ble_debug!("No matching peripheral found for address: {}", address_clone);
-            None
-        });
-
-        let peripheral = match peripheral_result {
-            Some(p) => p,
+        let (peripheral, device_info) = match self
+            .scanner
+            .as_ref()
+            .and_then(|scanner| scanner.get_cached_peripheral(&address_str))
+        {
+            Some(cached) => cached,
             None => {
                 let error = BleError::DeviceNotFound(address_str.clone());
                 error.log_error();
-                ble_warn!("Device {} not found. Make sure to scan first.", address_str);
+                ble_warn!(
+                    "Device {} not found in scan cache. Make sure to scan first.",
+                    address_str
+                );
                 self.base_mut()
                     .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
                 return None;
@@ -777,7 +776,17 @@ impl BluetoothManager {
             }
         };
 
-        let device = BleDevice::new(peripheral, runtime.clone(), event_tx);
+        let device_name = device_info
+            .as_ref()
+            .and_then(|info| info.name.clone())
+            .unwrap_or_default();
+        let device = BleDevice::new(
+            peripheral,
+            runtime.clone(),
+            address_str.clone(),
+            device_name,
+            event_tx,
+        );
 
         let insert_ok = match self.devices.lock() {
             Ok(mut devices) => {
@@ -891,6 +900,94 @@ impl BluetoothManager {
             }
         }
         events
+    }
+
+    fn collect_pairing_events(&mut self) -> Vec<PairingEvent> {
+        let mut events = Vec::new();
+        if let Some(ref rx_arc) = self.pairing_rx {
+            if let Ok(mut rx) = rx_arc.lock() {
+                while let Ok(event) = rx.try_recv() {
+                    events.push(event);
+                }
+            }
+        }
+        events
+    }
+
+    fn handle_pairing_event(&mut self, event: PairingEvent) {
+        if let Ok(mut states) = self.pairing_states.lock() {
+            states.insert(event.address.clone(), event.state.clone());
+        } else {
+            ble_error!("Failed to acquire pairing state cache lock");
+        }
+
+        if event.emit_finished {
+            self.base_mut().emit_signal(
+                "pairing_finished",
+                &[
+                    GString::from(&event.address).to_variant(),
+                    event.success.to_variant(),
+                    GString::from(&event.status).to_variant(),
+                ],
+            );
+        }
+    }
+
+    fn pairing_sender(&self) -> Option<Arc<Mutex<mpsc::UnboundedSender<PairingEvent>>>> {
+        self.pairing_tx.clone()
+    }
+
+    fn spawn_pairing_state_refresh(&self, address: String) {
+        let Some(runtime_mgr) = &self.runtime else {
+            return;
+        };
+        let Some(tx) = self.pairing_sender() else {
+            return;
+        };
+
+        runtime_mgr.spawn(async move {
+            let state = crate::windows_pairing::get_pairing_state_async(&address).await;
+            let event = PairingEvent {
+                address,
+                success: state.paired,
+                status: state.status.clone(),
+                state,
+                emit_finished: false,
+            };
+            if let Ok(tx_guard) = tx.lock() {
+                let _ = tx_guard.send(event);
+            }
+        });
+    }
+
+    fn spawn_pairing_operation(&self, address: String, action: PairingAction) -> bool {
+        let Some(runtime_mgr) = &self.runtime else {
+            return false;
+        };
+        let Some(tx) = self.pairing_sender() else {
+            return false;
+        };
+
+        runtime_mgr.spawn(async move {
+            let result = match action {
+                PairingAction::Pair => crate::windows_pairing::pair_device_async(&address).await,
+                PairingAction::Unpair => {
+                    crate::windows_pairing::unpair_device_async(&address).await
+                }
+            };
+            let state = crate::windows_pairing::get_pairing_state_async(&address).await;
+            let event = PairingEvent {
+                address,
+                success: result.success,
+                status: result.status,
+                state,
+                emit_finished: true,
+            };
+            if let Ok(tx_guard) = tx.lock() {
+                let _ = tx_guard.send(event);
+            }
+        });
+        true
     }
 
     fn emit_event_deferred(&mut self, event: BleDeviceEvent) {

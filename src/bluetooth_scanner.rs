@@ -1,5 +1,5 @@
 use btleplug::api::{Central, CentralEvent, Peripheral as _, PeripheralProperties, ScanFilter};
-use btleplug::platform::Adapter;
+use btleplug::platform::{Adapter, Peripheral};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,9 @@ pub struct BluetoothScanner {
 
     /// Map of discovered devices by address
     discovered_devices: Arc<Mutex<HashMap<String, DeviceInfo>>>,
+
+    /// Map of discovered peripherals by address, used for non-blocking connects
+    discovered_peripherals: Arc<Mutex<HashMap<String, Peripheral>>>,
 }
 
 impl BluetoothScanner {
@@ -44,6 +47,7 @@ impl BluetoothScanner {
             runtime,
             is_scanning: Arc::new(Mutex::new(false)),
             discovered_devices: Arc::new(Mutex::new(HashMap::new())),
+            discovered_peripherals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -95,16 +99,24 @@ impl BluetoothScanner {
                 ble_debug!("Cleared {} previous scan results", prev_count);
             }
         }
+        {
+            let mut peripherals = self.discovered_peripherals.lock().map_err(|e| {
+                let error = BleError::InternalError(format!("Lock error: {}", e));
+                error.log_error();
+                error
+            })?;
+            peripherals.clear();
+        }
 
         // Start scanning
         ble_debug!("Initiating adapter scan");
         ble_debug!("Scan filter: {:?}", ScanFilter::default());
 
-        eprintln!("[GDBLE] start_scan: calling adapter.start_scan()...");
+        ble_debug!("start_scan: calling adapter.start_scan()");
         let scan_result = self.adapter.start_scan(ScanFilter::default()).await;
         match &scan_result {
-            Ok(_) => eprintln!("[GDBLE] start_scan: adapter.start_scan() OK"),
-            Err(e) => eprintln!("[GDBLE] start_scan: adapter.start_scan() ERROR: {}", e),
+            Ok(_) => ble_debug!("start_scan: adapter.start_scan() OK"),
+            Err(e) => ble_debug!("start_scan: adapter.start_scan() ERROR: {}", e),
         }
 
         scan_result.map_err(|e| {
@@ -114,11 +126,17 @@ impl BluetoothScanner {
         })?;
 
         let result = timeout(scan_duration, self.collect_devices(device_tx.clone())).await;
-        eprintln!("[GDBLE] start_scan: collect_devices finished (timeout or done)");
+        ble_debug!("start_scan: collect_devices finished (timeout or done)");
 
         // Stop scanning
         let stop_result = self.adapter.stop_scan().await;
-        eprintln!("[GDBLE] start_scan: stop_scan result = {:?}", stop_result.as_ref().map(|_| "Ok").map_err(|e| e.to_string()));
+        ble_debug!(
+            "start_scan: stop_scan result = {:?}",
+            stop_result
+                .as_ref()
+                .map(|_| "Ok")
+                .map_err(|e| e.to_string())
+        );
 
         // Update scanning state
         {
@@ -143,21 +161,29 @@ impl BluetoothScanner {
         // After stop_scan() the BlueZ cache is authoritative — querying it gives the final,
         // fully-populated properties (name + service UUIDs) for every device seen during scan.
         match self.adapter.peripherals().await {
-            Err(e) => eprintln!("[GDBLE] post-scan peripherals() ERROR: {}", e),
+            Err(e) => ble_debug!("post-scan peripherals() ERROR: {}", e),
             Ok(peripherals) => {
-                eprintln!("[GDBLE] post-scan peripherals() count: {}", peripherals.len());
+                ble_debug!("post-scan peripherals() count: {}", peripherals.len());
                 for peripheral in peripherals {
                     if let Ok(Some(properties)) = peripheral.properties().await {
                         let address = peripheral.id().to_string();
-                        eprintln!("[GDBLE] post-scan peripheral: addr={} name={:?} services={:?}",
+                        ble_debug!(
+                            "post-scan peripheral: addr={} name={:?} services={:?}",
                             address,
                             properties.local_name,
-                            properties.services.iter().map(|u| u.to_string()).collect::<Vec<_>>()
+                            properties
+                                .services
+                                .iter()
+                                .map(|u| u.to_string())
+                                .collect::<Vec<_>>()
                         );
-                        let device_info = Self::create_device_info(address.clone(), properties).await;
+                        self.cache_peripheral(address.clone(), peripheral.clone());
+                        let device_info = Self::create_device_info(address.clone(), properties);
                         let needs_update = if let Ok(mut devices) = self.discovered_devices.lock() {
                             let stale = match devices.get(&address) {
-                                Some(old) => old.services.is_empty() && !device_info.services.is_empty(),
+                                Some(old) => {
+                                    old.services.is_empty() && !device_info.services.is_empty()
+                                }
                                 None => true,
                             };
                             devices.insert(address.clone(), device_info.clone());
@@ -224,7 +250,7 @@ impl BluetoothScanner {
 
         ble_debug!("Events stream created successfully");
 
-        eprintln!("[GDBLE] collect_devices: events stream open, waiting for BLE events...");
+        ble_debug!("collect_devices: events stream open, waiting for BLE events");
         let mut event_count = 0;
         let mut discovered_count = 0;
         let max_events = 10000;
@@ -239,13 +265,21 @@ impl BluetoothScanner {
             match event {
                 CentralEvent::DeviceDiscovered(id) => {
                     discovered_count += 1;
-                    eprintln!("[GDBLE] DeviceDiscovered: id={}", id);
+                    ble_debug!("DeviceDiscovered: id={}", id);
                     if let Ok(peripheral) = self.adapter.peripheral(&id).await {
                         if let Ok(Some(properties)) = peripheral.properties().await {
                             let address = id.to_string();
-                            eprintln!("[GDBLE]   -> name={:?} services={:?}", properties.local_name, properties.services.iter().map(|u| u.to_string()).collect::<Vec<_>>());
-                            let device_info =
-                                Self::create_device_info(address.clone(), properties).await;
+                            ble_debug!(
+                                "  -> name={:?} services={:?}",
+                                properties.local_name,
+                                properties
+                                    .services
+                                    .iter()
+                                    .map(|u| u.to_string())
+                                    .collect::<Vec<_>>()
+                            );
+                            self.cache_peripheral(address.clone(), peripheral);
+                            let device_info = Self::create_device_info(address.clone(), properties);
 
                             if let Ok(mut devices) = self.discovered_devices.lock() {
                                 devices.insert(address.clone(), device_info.clone());
@@ -257,18 +291,18 @@ impl BluetoothScanner {
                                 ble_warn!("Failed to send device info through channel");
                             }
                         } else {
-                            eprintln!("[GDBLE]   -> properties() returned None or Err");
+                            ble_debug!("  -> properties() returned None or Err");
                         }
                     } else {
-                        eprintln!("[GDBLE]   -> peripheral() lookup failed");
+                        ble_debug!("  -> peripheral() lookup failed");
                     }
                 }
                 CentralEvent::DeviceUpdated(id) => {
                     if let Ok(peripheral) = self.adapter.peripheral(&id).await {
                         if let Ok(Some(properties)) = peripheral.properties().await {
                             let address = id.to_string();
-                            let device_info =
-                                Self::create_device_info(address.clone(), properties).await;
+                            self.cache_peripheral(address.clone(), peripheral);
+                            let device_info = Self::create_device_info(address.clone(), properties);
 
                             ble_debug!(
                                 "Updated device: {} ({}), RSSI: {:?}",
@@ -303,8 +337,9 @@ impl BluetoothScanner {
                         if let Ok(peripheral) = self.adapter.peripheral(&id).await {
                             if let Ok(Some(properties)) = peripheral.properties().await {
                                 let address = id.to_string();
+                                self.cache_peripheral(address.clone(), peripheral);
                                 let device_info =
-                                    Self::create_device_info(address.clone(), properties).await;
+                                    Self::create_device_info(address.clone(), properties);
                                 let should_send =
                                     if let Ok(mut devices) = self.discovered_devices.lock() {
                                         let exists = devices.contains_key(&address);
@@ -324,7 +359,11 @@ impl BluetoothScanner {
             }
         }
 
-        eprintln!("[GDBLE] collect_devices done: {} total events, {} DeviceDiscovered", event_count, discovered_count);
+        ble_debug!(
+            "collect_devices done: {} total events, {} DeviceDiscovered",
+            event_count,
+            discovered_count
+        );
         Ok(())
     }
 
@@ -340,6 +379,20 @@ impl BluetoothScanner {
         }
     }
 
+    pub fn get_cached_peripheral(&self, address: &str) -> Option<(Peripheral, Option<DeviceInfo>)> {
+        let peripheral = self
+            .discovered_peripherals
+            .lock()
+            .ok()
+            .and_then(|peripherals| peripherals.get(address).cloned());
+        let device_info = self
+            .discovered_devices
+            .lock()
+            .ok()
+            .and_then(|devices| devices.get(address).cloned());
+        peripheral.map(|p| (p, device_info))
+    }
+
     /// Checks if currently scanning
     ///
     /// # Returns
@@ -352,7 +405,15 @@ impl BluetoothScanner {
         }
     }
 
-    async fn create_device_info(address: String, properties: PeripheralProperties) -> DeviceInfo {
+    fn cache_peripheral(&self, address: String, peripheral: Peripheral) {
+        if let Ok(mut peripherals) = self.discovered_peripherals.lock() {
+            peripherals.insert(address, peripheral);
+        } else {
+            ble_error!("Failed to acquire peripheral map lock");
+        }
+    }
+
+    fn create_device_info(address: String, properties: PeripheralProperties) -> DeviceInfo {
         let name = properties.local_name;
         let rssi = properties.rssi;
         let services: Vec<String> = properties
@@ -367,9 +428,8 @@ impl BluetoothScanner {
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
         let tx_power_level = properties.tx_power_level;
-        let pairing_state = crate::windows_pairing::get_pairing_state_async(&address).await;
 
-        DeviceInfo::new(
+        DeviceInfo::with_unknown_pairing(
             address,
             name,
             rssi,
@@ -377,9 +437,6 @@ impl BluetoothScanner {
             manufacturer_data,
             service_data,
             tx_power_level,
-            pairing_state.paired,
-            pairing_state.can_pair,
-            pairing_state.status,
         )
     }
 }

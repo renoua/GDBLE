@@ -80,7 +80,7 @@ mod platform {
             .unwrap_or_else(|err| PairingResult::failed(err.as_str()))
     }
 
-    async fn pair_device_async(address: &str) -> PairingResult {
+    pub async fn pair_device_async(address: &str) -> PairingResult {
         let info = match find_device_information(address).await {
             Ok(Some(info)) => info,
             Ok(None) => return PairingResult::failed("device_not_found"),
@@ -118,7 +118,7 @@ mod platform {
         }
     }
 
-    async fn unpair_device_async(address: &str) -> PairingResult {
+    pub async fn unpair_device_async(address: &str) -> PairingResult {
         let info = match find_device_information(address).await {
             Ok(Some(info)) => info,
             Ok(None) => return PairingResult::failed("device_not_found"),
@@ -208,6 +208,17 @@ mod platform {
     pub fn unpair_device(_address: &str) -> PairingResult {
         PairingResult::failed("unsupported_platform")
     }
+
+    pub async fn pair_device_async(_address: &str) -> PairingResult {
+        PairingResult::failed("unsupported_platform")
+    }
+
+    pub async fn unpair_device_async(_address: &str) -> PairingResult {
+        PairingResult::failed("unsupported_platform")
+    }
 }
 
-pub use platform::{get_pairing_state, get_pairing_state_async, pair_device, unpair_device};
+pub use platform::{
+    get_pairing_state, get_pairing_state_async, pair_device, pair_device_async, unpair_device,
+    unpair_device_async,
+};
