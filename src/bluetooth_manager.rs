@@ -143,6 +143,7 @@ impl INode for BluetoothManager {
         };
         if let Some(result) = init_ready {
             self.init_result = None;
+            eprintln!("[GDBLE] process: init result ready, calling handle_init_result");
             self.handle_init_result(result);
         }
 
@@ -379,14 +380,19 @@ impl BluetoothManager {
             Arc::new(Mutex::new(None));
         let slot_clone = slot.clone();
         if let Some(ref runtime_mgr) = self.runtime {
+            eprintln!("[GDBLE] initialize: spawning async adapter task");
             runtime_mgr.spawn(async move {
+                eprintln!("[GDBLE] async init task: started, calling get_adapter_async()...");
                 let result = Self::get_adapter_async().await;
+                eprintln!("[GDBLE] async init task: get_adapter_async() returned -> {}",
+                    result.as_ref().map(|_| "Ok(adapter)").unwrap_or_else(|e| Box::leak(format!("Err({})", e).into_boxed_str())));
                 if let Ok(mut guard) = slot_clone.lock() {
                     *guard = Some(result);
                 }
+                eprintln!("[GDBLE] async init task: result stored in slot");
             });
             self.init_result = Some(slot);
-            ble_debug!("Adapter acquisition task spawned, returning immediately");
+            eprintln!("[GDBLE] initialize: task spawned, returning to Godot");
         } else {
             let error = BleError::InitializationFailed("Runtime not created".to_string());
             error.log_error();
