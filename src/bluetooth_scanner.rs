@@ -2,6 +2,7 @@ use btleplug::api::{Central, CentralEvent, Peripheral as _, PeripheralProperties
 use btleplug::platform::{Adapter, Peripheral};
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -30,6 +31,10 @@ pub struct BluetoothScanner {
 
     /// Map of discovered peripherals by address, used for non-blocking connects
     discovered_peripherals: Arc<Mutex<HashMap<String, Peripheral>>>,
+
+    /// Set to true by `stop_scan` to interrupt `collect_devices` early.
+    /// Reset to false at the start of each new scan.
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl BluetoothScanner {
@@ -48,6 +53,7 @@ impl BluetoothScanner {
             is_scanning: Arc::new(Mutex::new(false)),
             discovered_devices: Arc::new(Mutex::new(HashMap::new())),
             discovered_peripherals: Arc::new(Mutex::new(HashMap::new())),
+            stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -85,6 +91,9 @@ impl BluetoothScanner {
 
             *scanning = true;
         }
+
+        // Reset early-stop flag for this scan cycle
+        self.stop_requested.store(false, Ordering::Relaxed);
 
         // Clear previous scan results
         {
@@ -125,7 +134,7 @@ impl BluetoothScanner {
             error
         })?;
 
-        let result = timeout(scan_duration, self.collect_devices(device_tx.clone())).await;
+        let result = timeout(scan_duration, self.collect_devices(device_tx.clone(), self.stop_requested.clone())).await;
         ble_debug!("start_scan: collect_devices finished (timeout or done)");
 
         // Stop scanning
@@ -208,11 +217,13 @@ impl BluetoothScanner {
         }
     }
 
-    /// Stops an ongoing scan
+    /// Stops an ongoing scan.
     ///
-    /// This method stops the current BLE scan if one is in progress.
+    /// Sets the `stop_requested` flag so that `collect_devices` exits on its next
+    /// event loop iteration (latency ≤ one BLE event, typically ≪ 100 ms).
+    /// Also spawns `adapter.stop_scan()` to close the BLE event stream,
+    /// which causes `collect_devices` to exit via the `None` arm of `stream.next()`.
     pub fn stop_scan(&self) {
-        // Update scanning state
         if let Ok(mut scanning) = self.is_scanning.lock() {
             if !*scanning {
                 return; // Not scanning
@@ -220,22 +231,28 @@ impl BluetoothScanner {
             *scanning = false;
         }
 
-        // Stop scan asynchronously
+        // Signal collect_devices to exit on next iteration
+        self.stop_requested.store(true, Ordering::Relaxed);
+
+        // Also stop the BLE adapter so the event stream closes
         let adapter = self.adapter.clone();
         let runtime = self.runtime.clone();
-
         runtime.spawn(async move {
             let _ = adapter.stop_scan().await;
         });
     }
 
-    /// Collects devices during scanning
+    /// Collects devices during scanning.
     ///
-    /// This internal method listens for device discovery events and sends them
-    /// through the channel immediately, while also updating the discovered_devices map.
+    /// Listens for BLE discovery events and sends them through the channel immediately,
+    /// while updating the `discovered_devices` map. Exits when:
+    /// - `stop_requested` is set to true (by `stop_scan`), or
+    /// - the event stream closes (after `adapter.stop_scan()`), or
+    /// - the outer `timeout` in `start_scan` fires.
     async fn collect_devices(
         &self,
         device_tx: mpsc::UnboundedSender<DeviceInfo>,
+        stop_requested: Arc<AtomicBool>,
     ) -> Result<(), BleError> {
         use btleplug::api::Peripheral as _;
 
@@ -253,14 +270,15 @@ impl BluetoothScanner {
         ble_debug!("collect_devices: events stream open, waiting for BLE events");
         let mut event_count = 0;
         let mut discovered_count = 0;
-        let max_events = 10000;
 
         while let Some(event) = events.next().await {
-            event_count += 1;
-            if event_count > max_events {
-                ble_warn!("Event limit reached, stopping collection to prevent infinite loop");
+            // Check early-stop flag (set by stop_scan)
+            if stop_requested.load(Ordering::Relaxed) {
+                ble_debug!("collect_devices: stop requested, exiting early");
                 break;
             }
+
+            event_count += 1;
 
             match event {
                 CentralEvent::DeviceDiscovered(id) => {

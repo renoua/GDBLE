@@ -4,6 +4,7 @@ use godot::classes::notify::NodeNotification;
 use godot::classes::Object;
 use godot::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -79,6 +80,11 @@ pub struct BluetoothManager {
 
     /// Last known native OS pairing states by address
     pairing_states: Arc<Mutex<HashMap<String, crate::windows_pairing::PairingState>>>,
+
+    /// Guard to prevent spawning multiple concurrent WinRT pairing-state refreshes
+    /// for the same address.  Set to true when a refresh is in flight, cleared when
+    /// the result arrives in process().
+    pairing_refresh_in_progress: Arc<AtomicBool>,
 }
 
 #[godot_api]
@@ -102,6 +108,7 @@ impl INode for BluetoothManager {
             pairing_rx: None,
             pairing_tx: None,
             pairing_states: Arc::new(Mutex::new(HashMap::new())),
+            pairing_refresh_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -328,6 +335,10 @@ impl BluetoothManager {
     ///
     /// On Windows this uses WinRT DeviceInformation.Pairing. Other platforms
     /// currently return paired=false and can_pair=false.
+    ///
+    /// If no cached state is available, a background refresh is started — but at most
+    /// one refresh runs at a time (guarded by `pairing_refresh_in_progress`) to avoid
+    /// accumulating WinRT enumeration tasks when this is called every frame from UI.
     #[func]
     pub fn get_pairing_state(&mut self, address: GString) -> VarDictionary {
         let address_str = address.to_string();
@@ -337,7 +348,9 @@ impl BluetoothManager {
             .ok()
             .and_then(|states| states.get(&address_str).cloned());
 
-        if cached.is_none() {
+        if cached.is_none()
+            && !self.pairing_refresh_in_progress.load(Ordering::Relaxed)
+        {
             self.spawn_pairing_state_refresh(address_str.clone());
         }
 
@@ -945,8 +958,15 @@ impl BluetoothManager {
             return;
         };
 
+        // Mark refresh as in-flight
+        self.pairing_refresh_in_progress.store(true, Ordering::Relaxed);
+        let in_progress = self.pairing_refresh_in_progress.clone();
+
         runtime_mgr.spawn(async move {
             let state = crate::windows_pairing::get_pairing_state_async(&address).await;
+            // Clear the in-flight flag before sending so the next get_pairing_state()
+            // call after process() drains the result can trigger another refresh.
+            in_progress.store(false, Ordering::Relaxed);
             let event = PairingEvent {
                 address,
                 success: state.paired,

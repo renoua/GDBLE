@@ -218,7 +218,7 @@ mod platform {
     }
 }
 
-pub use platform::{
-    get_pairing_state, get_pairing_state_async, pair_device, pair_device_async, unpair_device,
-    unpair_device_async,
-};
+// Only export the async variants — the synchronous wrappers create a new
+// current-thread Tokio runtime per call, which panics if called from within
+// an existing runtime context.  The manager uses only the async variants.
+pub use platform::{get_pairing_state_async, pair_device_async, unpair_device_async};

@@ -153,10 +153,7 @@ impl DeviceInfo {
         // Manufacturer Data
         let mut manuf_dict = VarDictionary::new();
         for (id, data) in &self.manufacturer_data {
-            let mut byte_array = PackedByteArray::new();
-            for byte in data {
-                byte_array.push(*byte);
-            }
+            let byte_array = PackedByteArray::from(data.as_slice());
             manuf_dict.set(*id, &byte_array);
         }
         dict.set("manufacturer_data", &manuf_dict);
@@ -164,10 +161,7 @@ impl DeviceInfo {
         // Service Data
         let mut service_data_dict = VarDictionary::new();
         for (uuid_str, data) in &self.service_data {
-            let mut byte_array = PackedByteArray::new();
-            for byte in data {
-                byte_array.push(*byte);
-            }
+            let byte_array = PackedByteArray::from(data.as_slice());
             service_data_dict.set(uuid_str.as_str(), &byte_array);
         }
         dict.set("service_data", &service_data_dict);
@@ -229,13 +223,16 @@ pub enum BleError {
 }
 
 impl BleError {
-    /// 转换为 GString (用于 Godot 信号)
+    /// Convert to GString for use in Godot signals.
     pub fn to_gstring(&self) -> GString {
-        GString::from(self.to_string().as_str())
+        GString::from(self.as_message().as_str())
     }
 
-    /// 转换为字符串描述
-    pub fn to_string(&self) -> String {
+    /// Human-readable error description.
+    /// Named `as_message` rather than `to_string` to avoid shadowing the
+    /// blanket `ToString` impl (which delegates to `Display`) and the resulting
+    /// risk of infinite recursion if `Display::fmt` were ever changed.
+    pub fn as_message(&self) -> String {
         match self {
             BleError::AdapterNotFound => "未找到蓝牙适配器，请确保系统蓝牙已启用".to_string(),
             BleError::DeviceNotFound(addr) => {
@@ -322,20 +319,20 @@ impl BleError {
         )
     }
 
-    /// 记录错误到控制台（线程安全）
+    /// Log error to stderr (thread-safe).
     pub fn log_error(&self) {
-        eprintln!("[BLE Error] {}: {}", self.error_code(), self.to_string());
+        eprintln!("[BLE Error] {}: {}", self.error_code(), self.as_message());
     }
 
-    /// 记录警告到控制台（线程安全）
+    /// Log warning to stderr (thread-safe).
     pub fn log_warning(&self) {
-        eprintln!("[BLE Warning] {}: {}", self.error_code(), self.to_string());
+        eprintln!("[BLE Warning] {}: {}", self.error_code(), self.as_message());
     }
 }
 
 impl std::fmt::Display for BleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        write!(f, "{}", self.as_message())
     }
 }
 
