@@ -30,27 +30,27 @@ jobs:
           - platform: macos
             os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: libgdble.dylib
+            artifact_name: libgdble_ljdc.dylib
 
           - platform: macos-arm
             os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: libgdble.dylib
+            artifact_name: libgdble_ljdc.dylib
 
           - platform: android-arm64
             os: ubuntu-latest
             target: aarch64-linux-android
-            artifact_name: libgdble.so
+            artifact_name: libgdble_ljdc.so
 
           - platform: android-x86_64
             os: ubuntu-latest
             target: x86_64-linux-android
-            artifact_name: libgdble.so
+            artifact_name: libgdble_ljdc.so
 
           - platform: linux
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: libgdble.so
+            artifact_name: libgdble_ljdc.so
 
           # - platform: android-armv7
           #   os: ubuntu-latest
@@ -139,19 +139,19 @@ jobs:
               cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/gdble_ljdc.windows.template_release.x86_64.dll
               ;;
             macos)
-              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble.macos.x86_64.dylib
+              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble_ljdc.macos.x86_64.dylib
               ;;
             macos-arm)
-              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble.macos.arm64.dylib
+              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble_ljdc.macos.arm64.dylib
               ;;
             android-arm64)
-              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble.android.arm64.so
+              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble_ljdc.android.arm64.so
               ;;
             android-x86_64)
-              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble.android.x86_64.so
+              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble_ljdc.android.x86_64.so
               ;;
             linux)
-              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble.linux.x86_64.so
+              cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/libgdble_ljdc.linux.x86_64.so
               ;;
             *)
               cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.platform }}/${{ matrix.artifact_name }}
@@ -191,28 +191,28 @@ jobs:
           fi
 
           # Copy macOS x86_64 binary
-          if [ -f artifacts/gdble-macos/libgdble.macos.x86_64.dylib ]; then
-            cp artifacts/gdble-macos/libgdble.macos.x86_64.dylib release/addons/gdble/libgdble.macos.x86_64.dylib
+          if [ -f artifacts/gdble-macos/libgdble_ljdc.macos.x86_64.dylib ]; then
+            cp artifacts/gdble-macos/libgdble_ljdc.macos.x86_64.dylib release/addons/gdble/libgdble_ljdc.macos.x86_64.dylib
           fi
 
           # Copy macOS ARM binary
-          if [ -f artifacts/gdble-macos-arm/libgdble.macos.arm64.dylib ]; then
-            cp artifacts/gdble-macos-arm/libgdble.macos.arm64.dylib release/addons/gdble/libgdble.macos.arm64.dylib
+          if [ -f artifacts/gdble-macos-arm/libgdble_ljdc.macos.arm64.dylib ]; then
+            cp artifacts/gdble-macos-arm/libgdble_ljdc.macos.arm64.dylib release/addons/gdble/libgdble_ljdc.macos.arm64.dylib
           fi
 
           # Copy Android ARM64 binary
-          if [ -f artifacts/gdble-android-arm64/libgdble.android.arm64.so ]; then
-            cp artifacts/gdble-android-arm64/libgdble.android.arm64.so release/addons/gdble/libgdble.android.arm64.so
+          if [ -f artifacts/gdble-android-arm64/libgdble_ljdc.android.arm64.so ]; then
+            cp artifacts/gdble-android-arm64/libgdble_ljdc.android.arm64.so release/addons/gdble/libgdble_ljdc.android.arm64.so
           fi
 
           # Copy Android x86_64 binary
-          if [ -f artifacts/gdble-android-x86_64/libgdble.android.x86_64.so ]; then
-            cp artifacts/gdble-android-x86_64/libgdble.android.x86_64.so release/addons/gdble/libgdble.android.x86_64.so
+          if [ -f artifacts/gdble-android-x86_64/libgdble_ljdc.android.x86_64.so ]; then
+            cp artifacts/gdble-android-x86_64/libgdble_ljdc.android.x86_64.so release/addons/gdble/libgdble_ljdc.android.x86_64.so
           fi
 
           # Copy Linux binary
-          if [ -f artifacts/gdble-linux/libgdble.linux.x86_64.so ]; then
-            cp artifacts/gdble-linux/libgdble.linux.x86_64.so release/addons/gdble/libgdble.linux.x86_64.so
+          if [ -f artifacts/gdble-linux/libgdble_ljdc.linux.x86_64.so ]; then
+            cp artifacts/gdble-linux/libgdble_ljdc.linux.x86_64.so release/addons/gdble/libgdble_ljdc.linux.x86_64.so
           fi
           
           # Copy documentation
@@ -286,30 +286,30 @@ jobs:
           fi
           
           # Copy macOS binaries
-          if [ -f artifacts/gdble-macos/libgdble.macos.x86_64.dylib ]; then
-            cp artifacts/gdble-macos/libgdble.macos.x86_64.dylib addons/gdble/libgdble.macos.x86_64.dylib
+          if [ -f artifacts/gdble-macos/libgdble_ljdc.macos.x86_64.dylib ]; then
+            cp artifacts/gdble-macos/libgdble_ljdc.macos.x86_64.dylib addons/gdble/libgdble_ljdc.macos.x86_64.dylib
             echo "✓ Downloaded macOS x86_64 binary"
           fi
 
-          if [ -f artifacts/gdble-macos-arm/libgdble.macos.arm64.dylib ]; then
-            cp artifacts/gdble-macos-arm/libgdble.macos.arm64.dylib addons/gdble/libgdble.macos.arm64.dylib
+          if [ -f artifacts/gdble-macos-arm/libgdble_ljdc.macos.arm64.dylib ]; then
+            cp artifacts/gdble-macos-arm/libgdble_ljdc.macos.arm64.dylib addons/gdble/libgdble_ljdc.macos.arm64.dylib
             echo "✓ Downloaded macOS ARM64 binary"
           fi
 
           # Copy Android binaries
-          if [ -f artifacts/gdble-android-arm64/libgdble.android.arm64.so ]; then
-            cp artifacts/gdble-android-arm64/libgdble.android.arm64.so addons/gdble/libgdble.android.arm64.so
+          if [ -f artifacts/gdble-android-arm64/libgdble_ljdc.android.arm64.so ]; then
+            cp artifacts/gdble-android-arm64/libgdble_ljdc.android.arm64.so addons/gdble/libgdble_ljdc.android.arm64.so
             echo "✓ Downloaded Android ARM64 binary"
           fi
 
-          if [ -f artifacts/gdble-android-x86_64/libgdble.android.x86_64.so ]; then
-            cp artifacts/gdble-android-x86_64/libgdble.android.x86_64.so addons/gdble/libgdble.android.x86_64.so
+          if [ -f artifacts/gdble-android-x86_64/libgdble_ljdc.android.x86_64.so ]; then
+            cp artifacts/gdble-android-x86_64/libgdble_ljdc.android.x86_64.so addons/gdble/libgdble_ljdc.android.x86_64.so
             echo "✓ Downloaded Android x86_64 binary"
           fi
 
           # Copy Linux binary
-          if [ -f artifacts/gdble-linux/libgdble.linux.x86_64.so ]; then
-            cp artifacts/gdble-linux/libgdble.linux.x86_64.so addons/gdble/libgdble.linux.x86_64.so
+          if [ -f artifacts/gdble-linux/libgdble_ljdc.linux.x86_64.so ]; then
+            cp artifacts/gdble-linux/libgdble_ljdc.linux.x86_64.so addons/gdble/libgdble_ljdc.linux.x86_64.so
             echo "✓ Downloaded Linux binary"
           fi
 
