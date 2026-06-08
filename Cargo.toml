@@ -21,8 +21,15 @@ default = []
 android = []
 
 [lib]
+name = "gdble_ljdc"
 crate-type = ["cdylib"]
 
 [profile.release]
 opt-level = 3
 lto = true
+
+# Patch btleplug with WinRT fix: SetMaintainConnection(true) so GATT characteristics
+# are discoverable for non-bonded trainers (Wahoo KICKR, Tacx Flux…) on Windows.
+# Source vendored locally in vendor/btleplug — can be pushed as a GitHub fork if needed.
+[patch.crates-io]
+btleplug = { path = "vendor/btleplug" }
