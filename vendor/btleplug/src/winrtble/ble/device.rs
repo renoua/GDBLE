@@ -307,11 +307,44 @@ impl BLEDevice {
 
     pub async fn discover_services(&mut self) -> Result<&[GattDeviceService]> {
         let winrt_error = |e| Error::Other(format!("{:?}", e).into());
-        let service_result = self.get_gatt_services(BluetoothCacheMode::Cached).await?;
+
+        // Non-paired devices (KICKR, Tacx) don't persist GATT attribute data across
+        // connections on Windows, so the Cached service list may be empty or stale.
+        // Query IsPaired() synchronously (no I/O) and use Uncached when not bonded.
+        // Paired devices use Cached — their GATT data was saved during bonding and is
+        // always accurate.
+        let is_paired = self.device
+            .DeviceInformation()
+            .ok()
+            .and_then(|di| di.Pairing().ok())
+            .map(|p| p.IsPaired().unwrap_or(false))
+            .unwrap_or(false);
+
+        let cache_mode = if is_paired {
+            BluetoothCacheMode::Cached
+        } else {
+            debug!("discover_services: non-paired device, using Uncached mode");
+            BluetoothCacheMode::Uncached
+        };
+
+        // Mirror the timeout+fallback from get_characteristics: some Windows BLE drivers
+        // hang indefinitely on Uncached requests.
+        let service_result = match timeout(
+            GATT_CACHE_TIMEOUT,
+            self.get_gatt_services(cache_mode),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!("Uncached service discovery timed out, falling back to cached mode");
+                self.get_gatt_services(BluetoothCacheMode::Cached).await?
+            }
+        };
+
         let status = service_result.Status().map_err(winrt_error)?;
         if status == GattCommunicationStatus::Success {
-            // We need to convert the IVectorView to a Vec, because IVectorView is not Send and so
-            // can't be help past the await point below.
+            // IVectorView is not Send — convert to Vec before any await point.
             let services: Vec<_> = service_result
                 .Services()
                 .map_err(winrt_error)?
