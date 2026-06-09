@@ -18,8 +18,8 @@ use crate::{
     winrtble::utils,
 };
 
-use log::{debug, trace};
-use std::{collections::HashMap, future::IntoFuture};
+use log::{debug, trace, warn};
+use std::{collections::HashMap, future::IntoFuture, time::Duration};
 use uuid::Uuid;
 use windows::core::Ref;
 use windows::{
@@ -100,53 +100,131 @@ impl BLECharacteristic {
         }
     }
 
-    pub async fn subscribe(&mut self, on_value_changed: NotifiyEventHandler) -> Result<()> {
-        {
-            let value_handler = TypedEventHandler::new(
-                move |_: Ref<GattCharacteristic>, args: Ref<GattValueChangedEventArgs>| {
-                    if let Ok(args) = args.ok() {
-                        let value = args.CharacteristicValue()?;
-                        let reader = DataReader::FromBuffer(&value)?;
-                        let len = reader.UnconsumedBufferLength()? as usize;
-                        let mut input: Vec<u8> = vec![0u8; len];
-                        reader.ReadBytes(&mut input[0..len])?;
-                        trace!("changed {:?}", input);
-                        on_value_changed(input);
-                    }
-                    Ok(())
-                },
-            );
-            let token = self.characteristic.ValueChanged(&value_handler)?;
-            self.notify_token = Some(token);
-        }
-        let config = to_descriptor_value(self.characteristic.CharacteristicProperties()?);
-        if config == GattClientCharacteristicConfigurationDescriptorValue::None {
-            return Err(Error::NotSupported("Can not subscribe to attribute".into()));
-        }
+    /// Synchronous part of subscribing: registers the `ValueChanged` handler and returns a clone
+    /// of the `GattCharacteristic` (COM reference) together with the CCCD config value.
+    ///
+    /// The caller **must** call [`BLECharacteristic::write_cccd_with_retry`] with the returned
+    /// values **without holding any DashMap guard** (Fix C — avoids blocking worker threads on a
+    /// shared service shard while awaiting I/O).
+    ///
+    /// # Fix A1
+    /// If `CharacteristicProperties()` reports neither Notify nor Indicate (can happen for
+    /// non-bonded trainers whose property cache is stale on Windows), but a CCCD descriptor
+    /// (0x2902) is present in `self.descriptors`, we assume `Notify` rather than failing
+    /// immediately — matching bleak's behavior.
+    ///
+    /// On error the `notify_token` is cleaned up before returning.
+    pub fn setup_notify(
+        &mut self,
+        on_value_changed: NotifiyEventHandler,
+    ) -> Result<(GattCharacteristic, GattClientCharacteristicConfigurationDescriptorValue)> {
+        let value_handler = TypedEventHandler::new(
+            move |_: Ref<GattCharacteristic>, args: Ref<GattValueChangedEventArgs>| {
+                if let Ok(args) = args.ok() {
+                    let value = args.CharacteristicValue()?;
+                    let reader = DataReader::FromBuffer(&value)?;
+                    let len = reader.UnconsumedBufferLength()? as usize;
+                    let mut input: Vec<u8> = vec![0u8; len];
+                    reader.ReadBytes(&mut input[0..len])?;
+                    trace!("changed {:?}", input);
+                    on_value_changed(input);
+                }
+                Ok(())
+            },
+        );
+        let token = self.characteristic.ValueChanged(&value_handler)?;
+        self.notify_token = Some(token);
 
-        let status = self
-            .characteristic
-            .WriteClientCharacteristicConfigurationDescriptorAsync(config)?
-            .into_future()
-            .await?;
-        trace!("subscribe {:?}", status);
-        if status == GattCommunicationStatus::Success {
-            Ok(())
+        let raw_config = to_descriptor_value(self.characteristic.CharacteristicProperties()?);
+
+        // Fix A1: property cache may be stale for non-bonded trainers on Windows.
+        // If no Notify/Indicate bit is set but a CCCD descriptor is present, assume Notify.
+        let config = if raw_config == GattClientCharacteristicConfigurationDescriptorValue::None {
+            const CCCD_UUID: Uuid = uuid::uuid!("00002902-0000-1000-8000-00805f9b34fb");
+            if self.descriptors.contains_key(&CCCD_UUID) {
+                warn!(
+                    "CharacteristicProperties() reports no Notify/Indicate but CCCD descriptor \
+                     present — assuming Notify (stale property cache on non-bonded device)"
+                );
+                GattClientCharacteristicConfigurationDescriptorValue::Notify
+            } else {
+                // Roll back token before surfacing the error.
+                let _ = self.characteristic.RemoveValueChanged(token);
+                self.notify_token = None;
+                return Err(Error::NotSupported("Can not subscribe to attribute".into()));
+            }
         } else {
-            Err(Error::Other(
-                format!("Windows UWP threw error on subscribe: {:?}", status).into(),
-            ))
+            raw_config
+        };
+
+        Ok((self.characteristic.clone(), config))
+    }
+
+    /// Rolls back a `notify_token` previously set by [`setup_notify`]. Called when
+    /// [`write_cccd_with_retry`] fails so the `ValueChanged` handler is unregistered.
+    pub fn cleanup_notify_token(&mut self) {
+        if let Some(token) = self.notify_token.take() {
+            let _ = self.characteristic.RemoveValueChanged(token);
         }
     }
 
-    pub async fn unsubscribe(&mut self) -> Result<()> {
-        if let Some(token) = &self.notify_token {
-            self.characteristic.RemoveValueChanged(*token)?;
+    /// Async part of subscribing: writes the CCCD descriptor with retry logic (Fix A2).
+    ///
+    /// This is an associated function (no `&self`) so it can be called after the DashMap guard
+    /// has been dropped. On failure the caller should call [`cleanup_notify_token`] to unregister
+    /// the `ValueChanged` handler.
+    ///
+    /// Retries up to 3 × 150 ms to absorb transient `Unreachable`/`AccessDenied` during LE link
+    /// setup — consistent with the retry already present in `device.rs::get_characteristics`.
+    pub async fn write_cccd_with_retry(
+        gatt_char: GattCharacteristic,
+        config: GattClientCharacteristicConfigurationDescriptorValue,
+    ) -> Result<()> {
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAY_MS: u64 = 150;
+
+        for attempt in 0..MAX_RETRIES {
+            let status = gatt_char
+                .WriteClientCharacteristicConfigurationDescriptorAsync(config)?
+                .into_future()
+                .await?;
+            trace!("subscribe attempt {} status {:?}", attempt, status);
+            if status == GattCommunicationStatus::Success {
+                return Ok(());
+            }
+            if attempt + 1 < MAX_RETRIES {
+                warn!(
+                    "CCCD write failed ({:?}), retrying ({}/{})",
+                    status,
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+            } else {
+                return Err(Error::Other(
+                    format!("Windows UWP threw error on subscribe: {:?}", status).into(),
+                ));
+            }
         }
-        self.notify_token = None;
+        Ok(())
+    }
+
+    /// Synchronous part of unsubscribing: removes the `ValueChanged` token and returns a clone of
+    /// the `GattCharacteristic` for the subsequent CCCD-None write.
+    ///
+    /// Like [`setup_notify`], the caller must call [`write_cccd_none`] outside any DashMap guard
+    /// (Fix C).
+    pub fn setup_unsubscribe(&mut self) -> Result<GattCharacteristic> {
+        if let Some(token) = self.notify_token.take() {
+            self.characteristic.RemoveValueChanged(token)?;
+        }
+        Ok(self.characteristic.clone())
+    }
+
+    /// Async part of unsubscribing: writes CCCD = None to stop notifications on the device.
+    pub async fn write_cccd_none(gatt_char: GattCharacteristic) -> Result<()> {
         let config = GattClientCharacteristicConfigurationDescriptorValue::None;
-        let status = self
-            .characteristic
+        let status = gatt_char
             .WriteClientCharacteristicConfigurationDescriptorAsync(config)?
             .into_future()
             .await?;

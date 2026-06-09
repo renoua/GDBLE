@@ -544,49 +544,90 @@ impl ApiPeripheral for Peripheral {
     }
 
     /// Enables either notify or indicate (depending on support) for the specified characteristic.
-    /// This is a synchronous call.
+    ///
+    /// Split into two phases to avoid holding the DashMap write-guard across the async CCCD write
+    /// (Fix C). Indoor Bike Data (0x2AD2) and FTMS Control Point (0x2AD9) share service 0x1826 →
+    /// same DashMap shard; holding the guard through an await would block any concurrent write to
+    /// the control-point characteristic on a multi-thread Tokio runtime.
+    ///
+    /// Phase 1 (sync, under guard): register the ValueChanged handler via
+    /// `BLECharacteristic::setup_notify`, which also applies the stale-property-cache fallback
+    /// (Fix A1) and returns a cloned `GattCharacteristic` + CCCD config.
+    ///
+    /// Phase 2 (async, no guard): write the CCCD with retry via
+    /// `BLECharacteristic::write_cccd_with_retry` (Fix A2).
     async fn subscribe(&self, characteristic: &Characteristic) -> Result<()> {
-        let ble_service = &mut *self
-            .shared
-            .ble_services
-            .get_mut(&characteristic.service_uuid)
-            .ok_or_else(|| Error::NotSupported("Service not found for subscribe".into()))?;
-        let ble_characteristic = ble_service
-            .characteristics
-            .get_mut(&characteristic.uuid)
-            .ok_or_else(|| Error::NotSupported("Characteristic not found for subscribe".into()))?;
         let notifications_sender = self.shared.notifications_channel.clone();
         let uuid = characteristic.uuid;
         let service_uuid = characteristic.service_uuid;
-        ble_characteristic
-            .subscribe(Box::new(move |value| {
+
+        // Phase 1: synchronous setup under DashMap guard — drop guard before any await.
+        let (gatt_char_clone, config) = {
+            let mut ble_service = self
+                .shared
+                .ble_services
+                .get_mut(&characteristic.service_uuid)
+                .ok_or_else(|| Error::NotSupported("Service not found for subscribe".into()))?;
+            let ble_characteristic = ble_service
+                .characteristics
+                .get_mut(&characteristic.uuid)
+                .ok_or_else(|| {
+                    Error::NotSupported("Characteristic not found for subscribe".into())
+                })?;
+            ble_characteristic.setup_notify(Box::new(move |value| {
                 let notification = ValueNotification {
                     uuid,
                     service_uuid,
                     value,
                 };
-                // Note: we ignore send errors here which may happen while there are no
-                // receivers...
+                // Ignore send errors — may happen while there are no receivers.
                 let _ = notifications_sender.send(notification);
-            }))
-            .await
+            }))?
+        }; // DashMap guard dropped here
+
+        // Phase 2: async CCCD write — no DashMap guard held.
+        if let Err(e) = BLECharacteristic::write_cccd_with_retry(gatt_char_clone, config).await {
+            // Roll back the ValueChanged token registered in Phase 1.
+            if let Some(mut ble_service) = self
+                .shared
+                .ble_services
+                .get_mut(&characteristic.service_uuid)
+            {
+                if let Some(ble_characteristic) =
+                    ble_service.characteristics.get_mut(&characteristic.uuid)
+                {
+                    ble_characteristic.cleanup_notify_token();
+                }
+            }
+            return Err(e);
+        }
+
+        Ok(())
     }
 
     /// Disables either notify or indicate (depending on support) for the specified characteristic.
-    /// This is a synchronous call.
+    ///
+    /// Same two-phase split as `subscribe` (Fix C): synchronous token removal under the DashMap
+    /// guard, then async CCCD-None write without holding the guard.
     async fn unsubscribe(&self, characteristic: &Characteristic) -> Result<()> {
-        let ble_service = &mut *self
-            .shared
-            .ble_services
-            .get_mut(&characteristic.service_uuid)
-            .ok_or_else(|| Error::NotSupported("Service not found for unsubscribe".into()))?;
-        let ble_characteristic = ble_service
-            .characteristics
-            .get_mut(&characteristic.uuid)
-            .ok_or_else(|| {
-                Error::NotSupported("Characteristic not found for unsubscribe".into())
-            })?;
-        ble_characteristic.unsubscribe().await
+        // Phase 1: synchronous token removal under guard.
+        let gatt_char_clone = {
+            let mut ble_service = self
+                .shared
+                .ble_services
+                .get_mut(&characteristic.service_uuid)
+                .ok_or_else(|| Error::NotSupported("Service not found for unsubscribe".into()))?;
+            let ble_characteristic = ble_service
+                .characteristics
+                .get_mut(&characteristic.uuid)
+                .ok_or_else(|| {
+                    Error::NotSupported("Characteristic not found for unsubscribe".into())
+                })?;
+            ble_characteristic.setup_unsubscribe()?
+        }; // DashMap guard dropped here
+
+        // Phase 2: async CCCD-None write — no guard held.
+        BLECharacteristic::write_cccd_none(gatt_char_clone).await
     }
 
     async fn read(&self, characteristic: &Characteristic) -> Result<Vec<u8>> {

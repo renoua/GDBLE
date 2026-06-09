@@ -1,61 +1,113 @@
 use godot::prelude::*;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 全局调试模式标志
 static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
 
-/// 设置调试模式
+// Log file — None until set_log_path() is called from GDScript.
+static LOG_FILE: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+
 pub fn set_debug_mode(enabled: bool) {
     DEBUG_MODE.store(enabled, Ordering::Relaxed);
 }
 
-/// 检查是否启用调试模式
 pub fn is_debug_mode() -> bool {
     DEBUG_MODE.load(Ordering::Relaxed)
 }
 
-/// 调试日志宏 - 仅在调试模式下输出
-/// 使用 eprintln! 确保线程安全，可以从任何线程调用
+/// Open (or create) a log file at `path`. Truncates on each run so the file
+/// only contains logs from the current session — easier to share.
+pub fn init_log_file(path: &str) {
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        Ok(f) => {
+            let mut guard = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(BufWriter::new(f));
+            drop(guard);
+            log_to_file("INFO", &format!("=== BLE log started — path: {} ===", path));
+        }
+        Err(e) => {
+            eprintln!("[BLE Error] Cannot open log file '{}': {}", path, e);
+        }
+    }
+}
+
+fn utc_hms() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => {
+            let s = d.as_secs();
+            format!(
+                "{:02}:{:02}:{:02}.{:03}",
+                (s / 3600) % 24,
+                (s / 60) % 60,
+                s % 60,
+                d.subsec_millis()
+            )
+        }
+        Err(_) => "??:??:??.???".into(),
+    }
+}
+
+pub fn log_to_file(level: &str, msg: &str) {
+    if let Ok(mut guard) = LOG_FILE.lock() {
+        if let Some(writer) = guard.as_mut() {
+            let line = format!("[{}] [{}] {}\n", utc_hms(), level, msg);
+            let _ = writer.write_all(line.as_bytes());
+            let _ = writer.flush();
+        }
+    }
+}
+
+// Thread-safe log macros — safe to call from Tokio tasks or WinRT callbacks.
+//
+// ble_debug / ble_info : written to file always; printed to stderr only when debug_mode is on.
+// ble_warn / ble_error : written to file AND always printed to stderr (no debug_mode gate).
+
 #[macro_export]
 macro_rules! ble_debug {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
+        let _msg = format!($($arg)*);
+        $crate::types::log_to_file("DEBUG", &_msg);
         if $crate::types::is_debug_mode() {
-            eprintln!("[BLE Debug] {}", format!($($arg)*));
+            eprintln!("[BLE Debug] {}", _msg);
         }
-    };
+    }};
 }
 
-/// 信息日志宏 - 仅在调试模式下输出
-/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_info {
-    ($($arg:tt)*) => {
+    ($($arg:tt)*) => {{
+        let _msg = format!($($arg)*);
+        $crate::types::log_to_file("INFO", &_msg);
         if $crate::types::is_debug_mode() {
-            eprintln!("[BLE Info] {}", format!($($arg)*));
+            eprintln!("[BLE Info] {}", _msg);
         }
-    };
+    }};
 }
 
-/// 警告日志宏 - 仅在调试模式下输出
-/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_warn {
-    ($($arg:tt)*) => {
-        if $crate::types::is_debug_mode() {
-            eprintln!("[BLE Warning] {}", format!($($arg)*));
-        }
-    };
+    ($($arg:tt)*) => {{
+        let _msg = format!($($arg)*);
+        $crate::types::log_to_file("WARN", &_msg);
+        eprintln!("[BLE Warning] {}", _msg);
+    }};
 }
 
-/// 错误日志宏 - 仅在调试模式下输出
-/// 使用 eprintln! 确保线程安全，可以从任何线程调用
 #[macro_export]
 macro_rules! ble_error {
-    ($($arg:tt)*) => {
-        if $crate::types::is_debug_mode() {
-            eprintln!("[BLE Error] {}", format!($($arg)*));
-        }
-    };
+    ($($arg:tt)*) => {{
+        let _msg = format!($($arg)*);
+        $crate::types::log_to_file("ERROR", &_msg);
+        eprintln!("[BLE Error] {}", _msg);
+    }};
 }
 
 /// 设备信息结构

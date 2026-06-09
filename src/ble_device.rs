@@ -544,74 +544,74 @@ impl BleDevice {
                 old.abort();
             }
 
-            let peripheral = self.peripheral.clone();
+            // Fix B: create the broadcast receiver NOW (before spawning the subscribe task)
+            // so that the first notification burst is never dropped.
+            //
+            // `peripheral.notifications()` only calls `broadcast::Sender::subscribe()` — no I/O
+            // — so `block_on` returns immediately and is safe to call from the Godot main thread
+            // (which is never inside the Tokio runtime).
+            let notifications_stream =
+                match self.runtime.block_on(self.peripheral.notifications()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        ble_error!("Failed to create notification stream for {}: {}", self.address, e);
+                        lock_or_recover!(self.subscribed_characteristics).remove(&char_uuid_lower);
+                        Self::send_event_via(
+                            &self.event_tx,
+                            BleDeviceEvent::SubscribeFailed {
+                                device_address: self.address.to_string(),
+                                char_uuid: char_uuid_lower,
+                                error: format!("notifications() failed: {}", e),
+                            },
+                        );
+                        return;
+                    }
+                };
+
             let subscribed = self.subscribed_characteristics.clone();
             let event_tx = self.event_tx.clone();
             let is_connected = self.is_connected.clone();
             let address = self.address.to_string();
-            let char_uuid_lower_for_cleanup = char_uuid_lower.clone();
             let subscribed_for_cleanup = self.subscribed_characteristics.clone();
             let event_tx_for_cleanup = self.event_tx.clone();
 
             let handle = self.runtime.spawn(async move {
                 ble_debug!("Notification dispatcher started for {}", address);
 
-                match peripheral.notifications().await {
-                    Ok(mut stream) => {
-                        while let Some(notification) = stream.next().await {
-                            let uuid_lower = notification.uuid.to_string().to_lowercase();
-                            let is_subscribed =
-                                lock_or_recover!(subscribed).contains(&uuid_lower);
-                            if is_subscribed {
-                                ble_debug!(
-                                    "Notification from {}: {} bytes",
-                                    uuid_lower,
-                                    notification.value.len()
-                                );
-                                Self::send_event_via(
-                                    &event_tx,
-                                    BleDeviceEvent::CharacteristicNotified {
-                                        device_address: address.clone(),
-                                        char_uuid: notification.uuid.to_string(),
-                                        data: notification.value,
-                                    },
-                                );
-                            }
-                        }
-
-                        // Stream ended — device disconnected (radio loss or explicit)
-                        ble_info!(
-                            "Notification stream ended for {} — emitting Disconnected",
-                            address
+                let mut stream = notifications_stream;
+                while let Some(notification) = stream.next().await {
+                    let uuid_lower = notification.uuid.to_string().to_lowercase();
+                    let is_subscribed = lock_or_recover!(subscribed).contains(&uuid_lower);
+                    if is_subscribed {
+                        ble_debug!(
+                            "Notification from {}: {} bytes",
+                            uuid_lower,
+                            notification.value.len()
                         );
-                        *lock_or_recover!(is_connected) = false;
-                        lock_or_recover!(subscribed_for_cleanup).clear();
                         Self::send_event_via(
-                            &event_tx_for_cleanup,
-                            BleDeviceEvent::Disconnected {
+                            &event_tx,
+                            BleDeviceEvent::CharacteristicNotified {
                                 device_address: address.clone(),
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        ble_error!(
-                            "Failed to get notification stream for {}: {}",
-                            address,
-                            e
-                        );
-                        // Remove the reserved UUID so GDScript can retry
-                        lock_or_recover!(subscribed_for_cleanup)
-                            .remove(&char_uuid_lower_for_cleanup);
-                        Self::send_event_via(
-                            &event_tx_for_cleanup,
-                            BleDeviceEvent::SubscribeFailed {
-                                device_address: address,
-                                char_uuid: char_uuid_lower_for_cleanup,
-                                error: format!("notifications() failed: {}", e),
+                                char_uuid: notification.uuid.to_string(),
+                                data: notification.value,
                             },
                         );
                     }
                 }
+
+                // Stream ended — device disconnected (radio loss or explicit)
+                ble_info!(
+                    "Notification stream ended for {} — emitting Disconnected",
+                    address
+                );
+                *lock_or_recover!(is_connected) = false;
+                lock_or_recover!(subscribed_for_cleanup).clear();
+                Self::send_event_via(
+                    &event_tx_for_cleanup,
+                    BleDeviceEvent::Disconnected {
+                        device_address: address.clone(),
+                    },
+                );
             });
 
             self.notification_dispatcher = Some(handle);

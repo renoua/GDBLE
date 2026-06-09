@@ -13,7 +13,8 @@ use crate::ble_device::BleDevice;
 use crate::bluetooth_scanner::BluetoothScanner;
 use crate::runtime::RuntimeManager;
 use crate::types::{
-    is_debug_mode, set_debug_mode, AdapterInfo, BleDeviceEvent, BleError, DeviceInfo,
+    init_log_file, is_debug_mode, set_debug_mode, AdapterInfo, BleDeviceEvent, BleError,
+    DeviceInfo,
 };
 use crate::{ble_debug, ble_error, ble_info, ble_warn};
 
@@ -305,6 +306,17 @@ impl BluetoothManager {
     /// * `status` - Native pairing status string
     #[signal]
     fn pairing_finished(address: GString, success: bool, status: GString);
+
+    /// Open a log file at the given path (truncated each run).
+    ///
+    /// Call this from GDScript with `OS.get_user_data_dir() + "/ble_debug.log"` so logs
+    /// land in Godot's user data directory where they are easy to find and share.
+    /// All ble_warn / ble_error messages (and ble_info / ble_debug when debug_mode is on)
+    /// are written there automatically.
+    #[func]
+    pub fn set_log_path(&self, path: GString) {
+        init_log_file(&path.to_string());
+    }
 
     /// Enable or disable debug mode
     ///
