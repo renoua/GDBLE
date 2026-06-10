@@ -42,10 +42,13 @@ pub fn to_descriptor_value(
 ) -> GattClientCharacteristicConfigurationDescriptorValue {
     let notify = GattCharacteristicProperties::Notify;
     let indicate = GattCharacteristicProperties::Indicate;
-    if properties & indicate == indicate {
-        GattClientCharacteristicConfigurationDescriptorValue::Indicate
-    } else if properties & notify == notify {
+    // Prefer Notify over Indicate (bleak behaviour): some FTMS trainers expose
+    // both flags on 2AD2/2A63 but only ever emit notifications — writing the
+    // CCCD as Indicate then "succeeds" while no data ever arrives.
+    if properties & notify == notify {
         GattClientCharacteristicConfigurationDescriptorValue::Notify
+    } else if properties & indicate == indicate {
+        GattClientCharacteristicConfigurationDescriptorValue::Indicate
     } else {
         GattClientCharacteristicConfigurationDescriptorValue::None
     }

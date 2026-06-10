@@ -5,7 +5,7 @@ use godot::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 
 use crate::ble_characteristic::{BleCharacteristicInfo, CharacteristicProperties};
@@ -19,6 +19,12 @@ enum CharEventKind {
     Subscribe,
     Unsubscribe,
 }
+
+/// Minimum spacing between two GATT operations on the same device.
+/// WinRT tolerates poorly interleaved CCCD/Control-Point writes (transient
+/// AccessDenied/Unreachable); the Python bridge (bleak) is strictly sequential
+/// with sleeps, which is what reliable trainers were validated against.
+const GATT_OP_SPACING_MS: u64 = 100;
 
 /// Recover from a poisoned Mutex by taking the inner value.
 /// Logs the poisoning so it's visible in the output even without debug mode.
@@ -74,6 +80,11 @@ pub struct BleDevice {
     /// Characteristic lookup cache populated after `discover_services`.
     /// Key: (service_uuid_lower, char_uuid_lower).
     char_cache: Arc<Mutex<HashMap<(String, String), Characteristic>>>,
+
+    /// Serializes GATT operations (read/write/subscribe/unsubscribe) so that
+    /// tasks spawned in quick succession from GDScript never interleave on the
+    /// radio link. Held across the operation plus a `GATT_OP_SPACING_MS` pause.
+    gatt_op_lock: Arc<TokioMutex<()>>,
 
     /// Event sender for thread-safe communication with BluetoothManager
     event_tx: Option<Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>>,
@@ -346,8 +357,10 @@ impl BleDevice {
                 let address = self.address.to_string();
                 let char_uuid_for_async = char_uuid_str.clone();
                 let event_tx = self.event_tx.clone();
+                let gatt_op_lock = self.gatt_op_lock.clone();
 
                 self.runtime.spawn(async move {
+                    let _gatt_guard = gatt_op_lock.lock().await;
                     match peripheral.read(&char).await {
                         Ok(data) => {
                             ble_info!(
@@ -377,6 +390,7 @@ impl BleDevice {
                             );
                         }
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(GATT_OP_SPACING_MS)).await;
                 });
             }
             None => {
@@ -432,8 +446,10 @@ impl BleDevice {
                 let char_uuid_for_async = char_uuid_str.clone();
                 let event_tx = self.event_tx.clone();
                 let data_vec: Vec<u8> = data.to_vec();
+                let gatt_op_lock = self.gatt_op_lock.clone();
 
                 self.runtime.spawn(async move {
+                    let _gatt_guard = gatt_op_lock.lock().await;
                     let write_type = if with_response {
                         WriteType::WithResponse
                     } else {
@@ -467,6 +483,7 @@ impl BleDevice {
                             );
                         }
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(GATT_OP_SPACING_MS)).await;
                 });
             }
             None => {
@@ -629,8 +646,10 @@ impl BleDevice {
                 let event_tx = self.event_tx.clone();
                 let subscribed_on_fail = self.subscribed_characteristics.clone();
                 let char_uuid_lower_on_fail = char_uuid_lower.clone();
+                let gatt_op_lock = self.gatt_op_lock.clone();
 
                 self.runtime.spawn(async move {
+                    let _gatt_guard = gatt_op_lock.lock().await;
                     match peripheral.subscribe(&char).await {
                         Ok(_) => {
                             ble_info!("Subscribed to characteristic {}", char_uuid_for_async);
@@ -658,6 +677,7 @@ impl BleDevice {
                             );
                         }
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(GATT_OP_SPACING_MS)).await;
                 });
             }
             None => {
@@ -713,8 +733,10 @@ impl BleDevice {
                 let address = self.address.to_string();
                 let char_uuid_for_async = char_uuid_str.clone();
                 let event_tx = self.event_tx.clone();
+                let gatt_op_lock = self.gatt_op_lock.clone();
 
                 self.runtime.spawn(async move {
+                    let _gatt_guard = gatt_op_lock.lock().await;
                     match peripheral.unsubscribe(&char).await {
                         Ok(_) => {
                             ble_info!(
@@ -742,6 +764,7 @@ impl BleDevice {
                             );
                         }
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(GATT_OP_SPACING_MS)).await;
                 });
             }
             None => {
@@ -797,6 +820,7 @@ impl BleDevice {
             subscribed_characteristics: Arc::new(Mutex::new(HashSet::new())),
             notification_dispatcher: None,
             char_cache: Arc::new(Mutex::new(HashMap::new())),
+            gatt_op_lock: Arc::new(TokioMutex::new(())),
             event_tx: Some(event_tx),
         })
     }

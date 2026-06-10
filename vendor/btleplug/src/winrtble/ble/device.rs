@@ -143,9 +143,10 @@ impl BLEDevice {
     ) -> Result<Vec<GattCharacteristic>> {
         // Retry loop: even with SetMaintainConnection(true), the first GATT exchange after
         // connecting may fail with Unreachable while the LE link is being established.
-        // 3 attempts × 150 ms covers the typical WinRT link-setup window.
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_DELAY_MS: u64 = 150;
+        // 5 attempts × 300 ms covers slow trainers where link setup + encryption exceeds
+        // the typical WinRT window.
+        const MAX_RETRIES: u32 = 5;
+        const RETRY_DELAY_MS: u64 = 300;
 
         for attempt in 0..MAX_RETRIES {
             let async_result = match timeout(
@@ -308,30 +309,18 @@ impl BLEDevice {
     pub async fn discover_services(&mut self) -> Result<&[GattDeviceService]> {
         let winrt_error = |e| Error::Other(format!("{:?}", e).into());
 
-        // Non-paired devices (KICKR, Tacx) don't persist GATT attribute data across
-        // connections on Windows, so the Cached service list may be empty or stale.
-        // Query IsPaired() synchronously (no I/O) and use Uncached when not bonded.
-        // Paired devices use Cached — their GATT data was saved during bonding and is
-        // always accurate.
-        let is_paired = self.device
-            .DeviceInformation()
-            .ok()
-            .and_then(|di| di.Pairing().ok())
-            .map(|p| p.IsPaired().unwrap_or(false))
-            .unwrap_or(false);
-
-        let cache_mode = if is_paired {
-            BluetoothCacheMode::Cached
-        } else {
-            debug!("discover_services: non-paired device, using Uncached mode");
-            BluetoothCacheMode::Uncached
-        };
+        // Always use Uncached, even for bonded devices: a Windows bonding can freeze a
+        // stale GATT cache (services/characteristics/CCCD handles that no longer match
+        // the device), which makes paired trainers fail persistently ("detected but no
+        // data"). bleak effectively queries the live device too. Aligns with
+        // get_characteristics, which already does Uncached → timeout → Cached fallback.
+        debug!("discover_services: using Uncached mode (timeout fallback: Cached)");
 
         // Mirror the timeout+fallback from get_characteristics: some Windows BLE drivers
         // hang indefinitely on Uncached requests.
         let service_result = match timeout(
             GATT_CACHE_TIMEOUT,
-            self.get_gatt_services(cache_mode),
+            self.get_gatt_services(BluetoothCacheMode::Uncached),
         )
         .await
         {

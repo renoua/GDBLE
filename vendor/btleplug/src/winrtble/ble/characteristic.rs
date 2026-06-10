@@ -157,6 +157,12 @@ impl BLECharacteristic {
             raw_config
         };
 
+        debug!(
+            "setup_notify {:?}: CCCD value chosen = {:?}",
+            self.characteristic.Uuid(),
+            config
+        );
+
         Ok((self.characteristic.clone(), config))
     }
 
@@ -174,14 +180,14 @@ impl BLECharacteristic {
     /// has been dropped. On failure the caller should call [`cleanup_notify_token`] to unregister
     /// the `ValueChanged` handler.
     ///
-    /// Retries up to 3 × 150 ms to absorb transient `Unreachable`/`AccessDenied` during LE link
+    /// Retries up to 5 × 300 ms to absorb transient `Unreachable`/`AccessDenied` during LE link
     /// setup — consistent with the retry already present in `device.rs::get_characteristics`.
     pub async fn write_cccd_with_retry(
         gatt_char: GattCharacteristic,
         config: GattClientCharacteristicConfigurationDescriptorValue,
     ) -> Result<()> {
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_DELAY_MS: u64 = 150;
+        const MAX_RETRIES: u32 = 5;
+        const RETRY_DELAY_MS: u64 = 300;
 
         for attempt in 0..MAX_RETRIES {
             let status = gatt_char
