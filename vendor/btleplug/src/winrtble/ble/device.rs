@@ -191,9 +191,17 @@ impl BLEDevice {
 
             match async_result.Status() {
                 Ok(GattCommunicationStatus::Success) => {
-                    let results = async_result.Characteristics()?;
-                    let count = results.Size().unwrap_or(0);
-                    debug!("characteristics {:?} (attempt {}/{}, mode={:?})", count, attempt + 1, MAX_RETRIES, cache_mode);
+                    // IVectorView<GattCharacteristic> is !Send (contains NonNull<c_void>).
+                    // Isolate it in a nested block so it is provably out of scope before any
+                    // await point — Rust's async state machine includes all live variables at
+                    // each await regardless of explicit drop() calls.
+                    let (count, characteristics) = {
+                        let results = async_result.Characteristics()?;
+                        let n = results.Size().unwrap_or(0);
+                        let chars: Vec<GattCharacteristic> = results.into_iter().collect();
+                        (n, chars)
+                    };  // `results` / IVectorView dropped here — never in the sleep await state
+                    debug!("characteristics {} (attempt {}/{}, mode={:?})", count, attempt + 1, MAX_RETRIES, cache_mode);
                     // WinRT Uncached can return Success with an empty list for non-bonded
                     // trainers (Wahoo KICKR, Tacx Flux…): the standard cycling services
                     // (FTMS, CPS) are enumerable only via the cached GATT table on Windows.
@@ -208,7 +216,7 @@ impl BLEDevice {
                         tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
                         continue;
                     }
-                    return Ok(results.into_iter().collect());
+                    return Ok(characteristics);
                 }
                 Ok(GattCommunicationStatus::ProtocolError) => {
                     // ProtocolError can occur transiently during encryption negotiation on
