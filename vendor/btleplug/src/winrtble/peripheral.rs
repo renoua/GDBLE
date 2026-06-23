@@ -460,7 +460,16 @@ impl ApiPeripheral for Peripheral {
             let gatt_services = device.discover_services().await?;
             for service in gatt_services {
                 let uuid = utils::to_uuid(&service.Uuid().unwrap());
-                if !self.shared.ble_services.contains_key(&uuid) {
+                // Re-enumerate if not yet cached OR if previously cached with 0 characteristics
+                // (can happen when WinRT returned Success+empty on the first Uncached attempt;
+                // a subsequent discover_services call after the Cached retry fix in get_characteristics
+                // should now populate it correctly).
+                let should_enumerate = self
+                    .shared
+                    .ble_services
+                    .get(&uuid)
+                    .map_or(true, |s| s.characteristics.is_empty());
+                if should_enumerate {
                     match BLEDevice::get_characteristics(service).await {
                         Ok(characteristics) => {
                             let characteristics = characteristics

@@ -145,21 +145,44 @@ impl BLEDevice {
         // connecting may fail with Unreachable while the LE link is being established.
         // 5 attempts × 300 ms covers slow trainers where link setup + encryption exceeds
         // the typical WinRT window.
+        //
+        // Cache-mode strategy (mirrors bleak behaviour):
+        //   - attempt 0 → Uncached: protects bonded trainers against stale Windows GATT
+        //     cache (services/CCCD handles that no longer match the device after re-pair).
+        //   - attempt ≥ 1 → Cached: WinRT sometimes returns Success+empty for standard
+        //     cycling services (FTMS 0x1826, CPS 0x1818) on non-bonded trainers when
+        //     queried Uncached — the cached table is populated during the GATT read phase
+        //     and always returns the real characteristics.  bleak reads Cached by default
+        //     which is why it works where the native path fails.
+        //
+        // Additionally, ProtocolError is now retried (it can occur transiently during
+        // encryption negotiation on non-bonded devices) and Success-but-empty is retried
+        // (the Cached attempt usually recovers it).
         const MAX_RETRIES: u32 = 5;
         const RETRY_DELAY_MS: u64 = 300;
 
         for attempt in 0..MAX_RETRIES {
+            // First attempt uses Uncached to avoid stale-cache issues on bonded trainers;
+            // subsequent attempts use Cached to recover characteristics that WinRT omits
+            // from Uncached results for non-bonded devices.
+            let cache_mode = if attempt == 0 {
+                BluetoothCacheMode::Uncached
+            } else {
+                BluetoothCacheMode::Cached
+            };
+
             let async_result = match timeout(
                 GATT_CACHE_TIMEOUT,
                 service
-                    .GetCharacteristicsWithCacheModeAsync(BluetoothCacheMode::Uncached)?
+                    .GetCharacteristicsWithCacheModeAsync(cache_mode)?
                     .into_future(),
             )
             .await
             {
                 Ok(result) => result?,
                 Err(_) => {
-                    warn!("Uncached characteristic discovery timed out, falling back to cached mode");
+                    // If even Cached times out, bail out immediately.
+                    warn!("Characteristic discovery timed out (attempt {}/{}, mode={:?}), falling back to cached mode", attempt + 1, MAX_RETRIES, cache_mode);
                     service
                         .GetCharacteristicsWithCacheModeAsync(BluetoothCacheMode::Cached)?
                         .await?
@@ -169,14 +192,42 @@ impl BLEDevice {
             match async_result.Status() {
                 Ok(GattCommunicationStatus::Success) => {
                     let results = async_result.Characteristics()?;
-                    debug!("characteristics {:?}", results.Size());
+                    let count = results.Size().unwrap_or(0);
+                    debug!("characteristics {:?} (attempt {}/{}, mode={:?})", count, attempt + 1, MAX_RETRIES, cache_mode);
+                    // WinRT Uncached can return Success with an empty list for non-bonded
+                    // trainers (Wahoo KICKR, Tacx Flux…): the standard cycling services
+                    // (FTMS, CPS) are enumerable only via the cached GATT table on Windows.
+                    // Retry with Cached mode instead of accepting the empty result.
+                    if count == 0 && attempt + 1 < MAX_RETRIES {
+                        warn!(
+                            "get_characteristics returned 0 characteristics (attempt {}/{}, mode={:?}), retrying with Cached mode",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            cache_mode
+                        );
+                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                        continue;
+                    }
                     return Ok(results.into_iter().collect());
                 }
                 Ok(GattCommunicationStatus::ProtocolError) => {
+                    // ProtocolError can occur transiently during encryption negotiation on
+                    // non-bonded devices.  Retry (with Cached on subsequent attempts) rather
+                    // than giving up immediately.
+                    if attempt + 1 < MAX_RETRIES {
+                        warn!(
+                            "get_characteristics ProtocolError (attempt {}/{}, mode={:?}), retrying",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            cache_mode
+                        );
+                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                        continue;
+                    }
                     return Err(Error::Other(
                         format!(
-                            "get_characteristics for {:?} encountered a protocol error",
-                            service
+                            "get_characteristics for {:?} encountered a protocol error after {} attempts",
+                            service, MAX_RETRIES
                         )
                         .into(),
                     ));
@@ -187,10 +238,11 @@ impl BLEDevice {
                     // giving up so non-bonded trainers (Wahoo, Tacx…) are given a fair chance.
                     if attempt + 1 < MAX_RETRIES {
                         warn!(
-                            "get_characteristics status={:?}, retrying ({}/{})",
+                            "get_characteristics status={:?} (attempt {}/{}, mode={:?}), retrying",
                             status,
                             attempt + 1,
-                            MAX_RETRIES
+                            MAX_RETRIES,
+                            cache_mode
                         );
                         tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
                         continue;
