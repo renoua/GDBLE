@@ -312,6 +312,22 @@ impl Peripheral {
             trace!("Could not emit an event. AdapterManager has been dropped");
         }
     }
+
+    /// Returns true if the service with `uuid` should be (re-)enumerated.
+    /// A service is enumerated when it is not yet cached, OR when it was previously cached
+    /// but came back with zero characteristics (can happen with WinRT Uncached mode on
+    /// non-bonded trainers — the Cached retry in get_characteristics fixes the root cause,
+    /// but this guard lets a second discover_services() recover an empty-cached service).
+    ///
+    /// This MUST remain a plain (non-async) fn so that the DashMap Ref — which contains
+    /// WinRT/COM types that are !Send — is never captured in the async discover_services
+    /// state machine.
+    fn service_needs_enumeration(&self, uuid: &Uuid) -> bool {
+        self.shared
+            .ble_services
+            .get(uuid)
+            .map_or(true, |s| s.characteristics.is_empty())
+    }
 }
 
 impl Display for Peripheral {
@@ -460,16 +476,10 @@ impl ApiPeripheral for Peripheral {
             let gatt_services = device.discover_services().await?;
             for service in gatt_services {
                 let uuid = utils::to_uuid(&service.Uuid().unwrap());
-                // Re-enumerate if not yet cached OR if previously cached with 0 characteristics
-                // (can happen when WinRT returned Success+empty on the first Uncached attempt;
-                // a subsequent discover_services call after the Cached retry fix in get_characteristics
-                // should now populate it correctly).
-                let should_enumerate = self
-                    .shared
-                    .ble_services
-                    .get(&uuid)
-                    .map_or(true, |s| s.characteristics.is_empty());
-                if should_enumerate {
+                // Re-enumerate if not yet cached OR if previously cached with 0 characteristics.
+                // Call the sync helper so the DashMap Ref (!Send due to WinRT/COM types)
+                // is never captured in this async function's state machine.
+                if self.service_needs_enumeration(&uuid) {
                     match BLEDevice::get_characteristics(service).await {
                         Ok(characteristics) => {
                             let characteristics = characteristics
