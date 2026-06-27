@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::ble_device::BleDevice;
-use crate::bluetooth_scanner::BluetoothScanner;
+use crate::bluetooth_scanner::{canonical_address, BluetoothScanner};
 use crate::runtime::RuntimeManager;
 use crate::types::{
     init_log_file, is_debug_mode, set_debug_mode, AdapterInfo, BleDeviceEvent, BleError,
@@ -29,6 +29,10 @@ struct PairingEvent {
 enum PairingAction {
     Pair,
     Unpair,
+}
+
+fn remove_by_canonical_address<T>(devices: &mut HashMap<String, T>, address: &str) -> Option<T> {
+    devices.remove(&canonical_address(address))
 }
 
 /// BluetoothManager is the main entry point for BLE functionality in Godot
@@ -721,7 +725,7 @@ impl BluetoothManager {
     /// or None if the device cannot be found or connection fails
     #[func]
     pub fn connect_device(&mut self, address: GString) -> Option<Gd<BleDevice>> {
-        let address_str = address.to_string();
+        let address_str = canonical_address(&address.to_string());
         ble_debug!("connect_device called for address: {}", address_str);
 
         if !self.is_initialized() {
@@ -832,15 +836,28 @@ impl BluetoothManager {
         ble_info!("Created BleDevice for {}", address_str);
 
         self.base_mut()
-            .emit_signal("device_connecting", &[address.to_variant()]);
+            .emit_signal("device_connecting", &[GString::from(&address_str).to_variant()]);
 
         Some(device)
+    }
+
+    /// Returns whether the latest scan cache contains this address.
+    ///
+    /// This lets higher-level reconnect coordinators scan before calling
+    /// connect_device(), without turning an expected empty-cache lookup into an error.
+    #[func]
+    pub fn is_device_cached(&self, address: GString) -> bool {
+        let address_str = canonical_address(&address.to_string());
+        self.scanner
+            .as_ref()
+            .map(|scanner| scanner.is_device_cached(&address_str))
+            .unwrap_or(false)
     }
 
     /// Disconnect a BLE device by address
     #[func]
     pub fn disconnect_device(&mut self, address: GString) {
-        let address_str = address.to_string();
+        let address_str = canonical_address(&address.to_string());
 
         let mut lock_failed = false;
         let device = match self.devices.lock() {
@@ -876,7 +893,7 @@ impl BluetoothManager {
     /// Get a connected device by address
     #[func]
     pub fn get_device(&self, address: GString) -> Option<Gd<BleDevice>> {
-        let address_str = address.to_string();
+        let address_str = canonical_address(&address.to_string());
         match self.devices.lock() {
             Ok(devices) => devices.get(&address_str).cloned(),
             Err(_) => {
@@ -1053,6 +1070,15 @@ impl BluetoothManager {
                         ],
                     );
                 }
+                // A failed instance may retain stale platform/GATT state. Remove it
+                // after queuing the signal so the next retry creates a fresh BleDevice.
+                if let Ok(mut devices) = self.devices.lock() {
+                    remove_by_canonical_address(&mut devices, &device_address);
+                } else {
+                    ble_error!(
+                        "Failed to acquire device map lock while removing failed device"
+                    );
+                }
             }
             BleDeviceEvent::Disconnected { device_address } => {
                 ble_info!("Device {} disconnected", device_address);
@@ -1062,7 +1088,7 @@ impl BluetoothManager {
                 }
                 {
                     if let Ok(mut devices) = self.devices.lock() {
-                        devices.remove(&device_address);
+                        remove_by_canonical_address(&mut devices, &device_address);
                     } else {
                         ble_error!(
                             "Failed to acquire device map lock while removing disconnected device"
@@ -1292,8 +1318,9 @@ impl BluetoothManager {
     }
 
     fn get_device_by_address(&self, address: &str) -> Option<Gd<BleDevice>> {
+        let address = canonical_address(address);
         match self.devices.lock() {
-            Ok(devices) => devices.get(address).cloned(),
+            Ok(devices) => devices.get(&address).cloned(),
             Err(_) => {
                 ble_error!("Failed to acquire device map lock in get_device_by_address");
                 None
@@ -1404,5 +1431,16 @@ mod tests {
         assert!(BluetoothManager::should_emit_scan_stopped(&mut emitted));
         emitted = false;
         assert!(BluetoothManager::should_emit_scan_stopped(&mut emitted));
+    }
+
+    #[test]
+    fn failed_device_cleanup_uses_canonical_address() {
+        let mut devices = HashMap::from([("DE:0C:AA:BB:CC:DD".to_string(), 42)]);
+
+        assert_eq!(
+            remove_by_canonical_address(&mut devices, "de:0c:aa:bb:cc:dd"),
+            Some(42)
+        );
+        assert!(devices.is_empty());
     }
 }

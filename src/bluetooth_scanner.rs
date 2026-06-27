@@ -12,6 +12,10 @@ use tokio::time::timeout;
 use crate::types::{BleError, DeviceInfo};
 use crate::{ble_debug, ble_error, ble_warn};
 
+pub(crate) fn canonical_address(address: &str) -> String {
+    address.trim().to_ascii_uppercase()
+}
+
 /// BluetoothScanner handles BLE device scanning operations
 ///
 /// This struct manages the scanning state and discovered devices.
@@ -175,7 +179,7 @@ impl BluetoothScanner {
                 ble_debug!("post-scan peripherals() count: {}", peripherals.len());
                 for peripheral in peripherals {
                     if let Ok(Some(properties)) = peripheral.properties().await {
-                        let address = peripheral.id().to_string();
+                        let address = canonical_address(&peripheral.id().to_string());
                         ble_debug!(
                             "post-scan peripheral: addr={} name={:?} services={:?}",
                             address,
@@ -286,7 +290,7 @@ impl BluetoothScanner {
                     ble_debug!("DeviceDiscovered: id={}", id);
                     if let Ok(peripheral) = self.adapter.peripheral(&id).await {
                         if let Ok(Some(properties)) = peripheral.properties().await {
-                            let address = id.to_string();
+                            let address = canonical_address(&id.to_string());
                             ble_debug!(
                                 "  -> name={:?} services={:?}",
                                 properties.local_name,
@@ -318,7 +322,7 @@ impl BluetoothScanner {
                 CentralEvent::DeviceUpdated(id) => {
                     if let Ok(peripheral) = self.adapter.peripheral(&id).await {
                         if let Ok(Some(properties)) = peripheral.properties().await {
-                            let address = id.to_string();
+                            let address = canonical_address(&id.to_string());
                             self.cache_peripheral(address.clone(), peripheral);
                             let device_info = Self::create_device_info(address.clone(), properties);
 
@@ -354,7 +358,7 @@ impl BluetoothScanner {
                     if !services.is_empty() {
                         if let Ok(peripheral) = self.adapter.peripheral(&id).await {
                             if let Ok(Some(properties)) = peripheral.properties().await {
-                                let address = id.to_string();
+                                let address = canonical_address(&id.to_string());
                                 self.cache_peripheral(address.clone(), peripheral);
                                 let device_info =
                                     Self::create_device_info(address.clone(), properties);
@@ -398,17 +402,26 @@ impl BluetoothScanner {
     }
 
     pub fn get_cached_peripheral(&self, address: &str) -> Option<(Peripheral, Option<DeviceInfo>)> {
+        let address = canonical_address(address);
         let peripheral = self
             .discovered_peripherals
             .lock()
             .ok()
-            .and_then(|peripherals| peripherals.get(address).cloned());
+            .and_then(|peripherals| peripherals.get(&address).cloned());
         let device_info = self
             .discovered_devices
             .lock()
             .ok()
-            .and_then(|devices| devices.get(address).cloned());
+            .and_then(|devices| devices.get(&address).cloned());
         peripheral.map(|p| (p, device_info))
+    }
+
+    pub fn is_device_cached(&self, address: &str) -> bool {
+        let address = canonical_address(address);
+        self.discovered_peripherals
+            .lock()
+            .map(|peripherals| peripherals.contains_key(&address))
+            .unwrap_or(false)
     }
 
     /// Checks if currently scanning
@@ -456,5 +469,18 @@ impl BluetoothScanner {
             service_data,
             tx_power_level,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_address;
+
+    #[test]
+    fn canonical_address_trims_and_normalizes_case() {
+        assert_eq!(
+            canonical_address(" de:0c:aa:bb:cc:dd "),
+            "DE:0C:AA:BB:CC:DD"
+        );
     }
 }
