@@ -90,6 +90,10 @@ pub struct BluetoothManager {
     /// for the same address.  Set to true when a refresh is in flight, cleared when
     /// the result arrives in process().
     pairing_refresh_in_progress: Arc<AtomicBool>,
+
+    /// Duration requested on the last `start_scan()` call, kept only so
+    /// `get_last_scan_report()` can report it back without needing its own parameter.
+    last_scan_duration_s: f64,
 }
 
 #[godot_api]
@@ -114,6 +118,7 @@ impl INode for BluetoothManager {
             pairing_tx: None,
             pairing_states: Arc::new(Mutex::new(HashMap::new())),
             pairing_refresh_in_progress: Arc::new(AtomicBool::new(false)),
+            last_scan_duration_s: 0.0,
         }
     }
 
@@ -345,6 +350,21 @@ impl BluetoothManager {
     #[func]
     pub fn is_debug_mode(&self) -> bool {
         is_debug_mode()
+    }
+
+    /// `"<Cargo.toml version>+<12-char git hash>"` of this native module, e.g.
+    /// `"0.5.5+a1b2c3d4e5f6"`. The Cargo.toml version alone can't tell a rebuilt
+    /// DLL apart from a stale one — it hasn't been bumped since well before the
+    /// June 2026 scan fixes — but the hash (baked in by build.rs) can be checked
+    /// directly against `git log --oneline -- addons/gdble_ljdc/native/src`.
+    /// Surfaced through `diagnostics_snapshot()`; `bin/` isn't tracked by version
+    /// control for Windows, so this is the only way a support report can confirm
+    /// which commit actually produced the DLL a player is running.
+    #[func]
+    pub fn get_version(&self) -> GString {
+        GString::from(
+            format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("GDBLE_GIT_HASH")).as_str(),
+        )
     }
 
     /// Get native OS pairing state for a device.
@@ -595,12 +615,30 @@ impl BluetoothManager {
         };
 
         if scanner.is_scanning() {
-            ble_warn!("Scan already in progress, ignoring request");
+            // Normally unreachable: native_ble_backend.gd guards with `_scan_active`
+            // before ever issuing a second start_scan while one is in flight. This
+            // used to return completely silently — no signal at all — so if it *was*
+            // reached (a GDScript/Rust state desync), the caller's request vanished
+            // with nothing to show for it beyond a debug-build console line.
+            //
+            // Deliberately NOT emitting scan_stopped here: a real scan is genuinely
+            // still running. Firing scan_stopped now would make the GDScript side
+            // publish an empty/partial result immediately, and since
+            // scan_stopped_emitted only resets per cycle, the real scan's own
+            // (later, genuine) scan_stopped would then be silently swallowed by
+            // emit_scan_stopped_once() — losing the real results entirely instead of
+            // just being slow. The in-flight scan's own completion still reaches
+            // GDScript normally; this just makes the rejected request visible.
+            let error = BleError::ScanFailed("Already scanning".to_string());
+            error.log_warning();
+            self.base_mut()
+                .emit_signal("error_occurred", &[error.to_gstring().to_variant()]);
             return;
         }
 
         ble_info!("Starting BLE device scan for {} seconds", timeout_seconds);
 
+        self.last_scan_duration_s = timeout_seconds;
         self.scan_stopped_emitted = false;
 
         // Emit scan_started signal
@@ -710,6 +748,69 @@ impl BluetoothManager {
             .iter()
             .map(|device| device.to_dictionary())
             .collect()
+    }
+
+    /// Diagnostic summary of the last (or current) scan — turns a silent "0
+    /// devices found" into something actionable: how many raw BLE advertisements
+    /// were actually seen, the adapter's power state, whether extended
+    /// advertisements were requested, etc. See `ScanReport` in types.rs.
+    ///
+    /// # Returns
+    /// An empty VarDictionary if no scan has ever been started.
+    #[func]
+    pub fn get_last_scan_report(&self) -> VarDictionary {
+        let (Some(scanner), Some(runtime_mgr)) = (&self.scanner, &self.runtime) else {
+            return VarDictionary::new();
+        };
+        let scanner = scanner.clone();
+        let duration_s = self.last_scan_duration_s;
+        // Blocking is fine here: this runs on the Godot main thread, which is not
+        // itself a worker of `runtime_mgr`'s Tokio runtime, so it's the standard
+        // "call an async fn synchronously from outside the runtime" pattern (see
+        // RuntimeManager::block_on's own doc comment). Used only for an on-demand
+        // diagnostics call, never per-frame.
+        let report = runtime_mgr.block_on(async move { scanner.build_scan_report(duration_s).await });
+        report.to_dictionary()
+    }
+
+    /// Enumerates BLE devices the OS currently has paired, independently of any
+    /// scan. Windows-only (empty elsewhere) — a trainer Windows keeps paired and
+    /// connected stops advertising entirely, so it can never appear in a scan on
+    /// any backend (native or the Python/bleak bridge). Returned entries have
+    /// `paired: true` and no service UUIDs (WinRT doesn't expose GATT services
+    /// without actually connecting); classification on the GDScript side falls
+    /// back to name matching for these.
+    ///
+    /// # Returns
+    /// An Array of VarDictionaries with `address`, `name`, `paired`, `services` (always empty).
+    #[func]
+    pub fn get_paired_devices(&self) -> Array<VarDictionary> {
+        let Some(ref runtime_mgr) = self.runtime else {
+            return Array::new();
+        };
+        let paired = runtime_mgr.block_on(crate::windows_pairing::get_paired_devices_async());
+        let mut out: Array<VarDictionary> = Array::new();
+        for device in paired {
+            let Some(raw_address) = device.bluetooth_address else {
+                continue;
+            };
+            let Ok(bd_addr) = btleplug::api::BDAddr::try_from(raw_address) else {
+                continue;
+            };
+            let address = canonical_address(&bd_addr.to_string());
+            let mut dict = VarDictionary::new();
+            dict.set("address", address);
+            if let Some(name) = device.name {
+                dict.set("name", name);
+            } else {
+                dict.set("name", &Variant::nil());
+            }
+            dict.set("paired", true);
+            let empty_services: Array<GString> = Array::new();
+            dict.set("services", &empty_services);
+            out.push(&dict);
+        }
+        out
     }
 
     /// Connect to a BLE device by address
@@ -920,6 +1021,8 @@ impl BluetoothManager {
 
     /// Async helper to get the Bluetooth adapter
     async fn get_adapter_async() -> Result<Adapter, BleError> {
+        use btleplug::api::{Central as _, CentralState};
+
         let manager = Manager::new()
             .await
             .map_err(|e| BleError::InitializationFailed(e.to_string()))?;
@@ -929,6 +1032,37 @@ impl BluetoothManager {
             .await
             .map_err(|e| BleError::InitializationFailed(e.to_string()))?;
 
+        if adapters.is_empty() {
+            return Err(BleError::AdapterNotFound);
+        }
+
+        // `adapters()` can list more than one Bluetooth radio (a USB dongle next to
+        // a built-in one, say). Blindly taking the first one — the previous
+        // behaviour — could silently pick an off/disabled radio while a working one
+        // sits right next to it, making every scan return nothing with no hint why.
+        // Query each adapter's state and prefer the first one reporting PoweredOn.
+        let mut states = Vec::with_capacity(adapters.len());
+        for adapter in &adapters {
+            states.push(adapter.adapter_state().await.ok());
+        }
+
+        if let Some(idx) = states
+            .iter()
+            .position(|s| *s == Some(CentralState::PoweredOn))
+        {
+            return Ok(adapters.into_iter().nth(idx).unwrap());
+        }
+
+        // No adapter reports PoweredOn. If at least one positively confirms
+        // PoweredOff (as opposed to the query failing/being unsupported, i.e.
+        // Unknown), surface that distinctly from "no adapter at all" — "turn
+        // Bluetooth on" and "no Bluetooth hardware" call for very different fixes.
+        if states.iter().any(|s| *s == Some(CentralState::PoweredOff)) {
+            return Err(BleError::BluetoothDisabled);
+        }
+
+        // State unknown/unsupported on this platform: fall back to the previous
+        // behaviour of taking whichever adapter the OS listed first.
         adapters.into_iter().next().ok_or(BleError::AdapterNotFound)
     }
 

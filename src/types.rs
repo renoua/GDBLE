@@ -272,6 +272,8 @@ pub enum BleError {
     Timeout(String),
     /// 内部错误
     InternalError(String),
+    /// 蓝牙适配器存在但已关闭（区别于 AdapterNotFound：硬件在，但用户/系统关闭了它）
+    BluetoothDisabled,
 }
 
 impl BleError {
@@ -336,6 +338,9 @@ impl BleError {
             BleError::InternalError(msg) => {
                 format!("内部错误: {}", msg)
             }
+            BleError::BluetoothDisabled => {
+                "蓝牙适配器存在但已关闭，请在系统设置中启用蓝牙".to_string()
+            }
         }
     }
 
@@ -360,6 +365,7 @@ impl BleError {
             BleError::PermissionDenied(_) => "PERMISSION_DENIED",
             BleError::Timeout(_) => "TIMEOUT",
             BleError::InternalError(_) => "INTERNAL_ERROR",
+            BleError::BluetoothDisabled => "BLUETOOTH_DISABLED",
         }
     }
 
@@ -371,14 +377,24 @@ impl BleError {
         )
     }
 
-    /// Log error to stderr (thread-safe).
+    /// Log error to stderr AND to ble_debug.log (thread-safe).
+    ///
+    /// Was stderr-only until this fix: every `BleError::log_error()` call in
+    /// bluetooth_scanner.rs/bluetooth_manager.rs (scan failures, adapter errors…)
+    /// was invisible in the file a player would actually send for support, because
+    /// it never went through `log_to_file` — only the separate `ble_debug!`/
+    /// `ble_warn!` macros did.
     pub fn log_error(&self) {
-        eprintln!("[BLE Error] {}: {}", self.error_code(), self.as_message());
+        let msg = format!("{}: {}", self.error_code(), self.as_message());
+        log_to_file("ERROR", &msg);
+        eprintln!("[BLE Error] {}", msg);
     }
 
-    /// Log warning to stderr (thread-safe).
+    /// Log warning to stderr AND to ble_debug.log (thread-safe). See `log_error`.
     pub fn log_warning(&self) {
-        eprintln!("[BLE Warning] {}: {}", self.error_code(), self.as_message());
+        let msg = format!("{}: {}", self.error_code(), self.as_message());
+        log_to_file("WARN", &msg);
+        eprintln!("[BLE Warning] {}", msg);
     }
 }
 
@@ -489,6 +505,39 @@ impl AdapterInfo {
             dict.set("address", &Variant::nil());
         }
 
+        dict
+    }
+}
+
+/// Résumé exploitable du dernier scan — exposé côté Godot via
+/// `BluetoothManager.get_last_scan_report()` pour transformer un "Aucun appareil
+/// trouvé" muet en diagnostic ("12 advertisements bruts vus, adaptateur éteint…").
+#[derive(Clone, Debug, Default)]
+pub struct ScanReport {
+    /// État de l'adaptateur au moment du scan ("PoweredOn"/"PoweredOff"/"Unknown"),
+    /// vide si l'appel `adapter_state()` a échoué.
+    pub adapter_state: String,
+    /// Nombre total d'événements BLE bruts reçus (DeviceDiscovered/Updated/
+    /// ServicesAdvertisement confondus) — un scan qui en reçoit 0 indique que le
+    /// watcher OS n'a rien livré du tout (cf. LJDC_BLE_EXTENDED_ADV).
+    pub raw_advertisements: u32,
+    /// Nombre d'adresses distinctes vues pendant le scan.
+    pub unique_devices: u32,
+    /// Valeur effective de LJDC_BLE_EXTENDED_ADV (Windows uniquement ; toujours
+    /// false sur les autres plateformes, qui n'ont pas ce mode).
+    pub extended_adv_requested: bool,
+    /// Durée demandée pour le scan, en secondes.
+    pub duration_s: f64,
+}
+
+impl ScanReport {
+    pub fn to_dictionary(&self) -> VarDictionary {
+        let mut dict = VarDictionary::new();
+        dict.set("adapter_state", self.adapter_state.clone());
+        dict.set("raw_advertisements", self.raw_advertisements);
+        dict.set("unique_devices", self.unique_devices);
+        dict.set("extended_adv_requested", self.extended_adv_requested);
+        dict.set("duration_s", self.duration_s);
         dict
     }
 }

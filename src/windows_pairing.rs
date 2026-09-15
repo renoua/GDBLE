@@ -40,6 +40,19 @@ impl PairingResult {
     }
 }
 
+/// A BLE device Windows already has paired, discovered independently of any BLE
+/// scan. A trainer already paired and held connected by Windows stops advertising
+/// entirely — neither this crate's watcher nor bleak can ever see it in a scan —
+/// so this is the only way such a trainer can be found at all.
+#[derive(Clone, Debug)]
+pub struct PairedDeviceInfo {
+    /// 48-bit Bluetooth address as returned by `BluetoothLEDevice::BluetoothAddress()`.
+    /// The caller converts this to the same "AA:BB:CC:DD:EE:FF" form used elsewhere
+    /// (via `btleplug::api::BDAddr`) so it matches addresses coming from a scan.
+    pub bluetooth_address: Option<u64>,
+    pub name: Option<String>,
+}
+
 #[cfg(windows)]
 mod platform {
     use super::{PairingResult, PairingState};
@@ -116,6 +129,52 @@ mod platform {
             },
             Err(err) => PairingResult::failed(&format!("pair_start_failed: {}", err)),
         }
+    }
+
+    /// Enumerates BLE devices Windows currently has paired, regardless of whether
+    /// they're advertising. Best-effort: any single device that fails to resolve
+    /// (name, id, or address lookup) is simply skipped rather than aborting the
+    /// whole enumeration.
+    pub async fn get_paired_devices_async() -> Vec<super::PairedDeviceInfo> {
+        let selector = match BluetoothLEDevice::GetDeviceSelectorFromPairingState(true) {
+            Ok(selector) => selector,
+            Err(_) => return Vec::new(),
+        };
+        let operation = match DeviceInformation::FindAllAsyncAqsFilter(&selector) {
+            Ok(operation) => operation,
+            Err(_) => return Vec::new(),
+        };
+        let infos = match operation.await {
+            Ok(infos) => infos,
+            Err(_) => return Vec::new(),
+        };
+
+        let count = infos.Size().unwrap_or(0);
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let Ok(info) = infos.GetAt(i) else {
+                continue;
+            };
+            let name = info
+                .Name()
+                .ok()
+                .map(|n| n.to_string())
+                .filter(|n| !n.is_empty());
+            let bluetooth_address = match info.Id() {
+                Ok(id) => resolve_bluetooth_address(&id).await,
+                Err(_) => None,
+            };
+            out.push(super::PairedDeviceInfo {
+                bluetooth_address,
+                name,
+            });
+        }
+        out
+    }
+
+    async fn resolve_bluetooth_address(device_id: &HSTRING) -> Option<u64> {
+        let device = BluetoothLEDevice::FromIdAsync(device_id).ok()?.await.ok()?;
+        device.BluetoothAddress().ok()
     }
 
     pub async fn unpair_device_async(address: &str) -> PairingResult {
@@ -216,9 +275,15 @@ mod platform {
     pub async fn unpair_device_async(_address: &str) -> PairingResult {
         PairingResult::failed("unsupported_platform")
     }
+
+    pub async fn get_paired_devices_async() -> Vec<super::PairedDeviceInfo> {
+        Vec::new()
+    }
 }
 
 // Only export the async variants — the synchronous wrappers create a new
 // current-thread Tokio runtime per call, which panics if called from within
 // an existing runtime context.  The manager uses only the async variants.
-pub use platform::{get_pairing_state_async, pair_device_async, unpair_device_async};
+pub use platform::{
+    get_paired_devices_async, get_pairing_state_async, pair_device_async, unpair_device_async,
+};

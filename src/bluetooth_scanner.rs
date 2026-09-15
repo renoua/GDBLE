@@ -1,19 +1,29 @@
 use btleplug::api::{Central, CentralEvent, Peripheral as _, PeripheralProperties, ScanFilter};
 use btleplug::platform::{Adapter, Peripheral};
 use futures::StreamExt;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::types::{BleError, DeviceInfo};
+use crate::types::{BleError, DeviceInfo, ScanReport};
 use crate::{ble_debug, ble_error, ble_warn};
 
 pub(crate) fn canonical_address(address: &str) -> String {
     address.trim().to_ascii_uppercase()
+}
+
+// Mirrors the parsing in vendor/btleplug/src/winrtble/ble/watcher.rs. That crate has
+// no logger wired to the game's ble_debug.log, so it can't report the effective
+// value anywhere useful — this side re-reads the same env var purely for the scan
+// report/logs. Trivial to keep in sync; not a behavioural dependency.
+fn extended_advertisements_requested() -> bool {
+    std::env::var("LJDC_BLE_EXTENDED_ADV")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// BluetoothScanner handles BLE device scanning operations
@@ -36,6 +46,18 @@ pub struct BluetoothScanner {
     /// Map of discovered peripherals by address, used for non-blocking connects
     discovered_peripherals: Arc<Mutex<HashMap<String, Peripheral>>>,
 
+    /// Addresses already forwarded through `device_tx` during the current scan.
+    /// Consulted by the post-scan pass so it publishes every device seen at least
+    /// once, instead of the narrower "went from no services to some services" rule
+    /// it used to apply.
+    sent_addresses: Arc<Mutex<HashSet<String>>>,
+
+    /// Total raw BLE events observed during the current/last scan (DeviceDiscovered
+    /// + DeviceUpdated + ServicesAdvertisement). Tracked as an atomic — not just a
+    /// local variable in `collect_devices` — because that future is usually dropped
+    /// mid-poll by the outer `timeout()`, which would otherwise lose the count.
+    last_event_count: Arc<AtomicU32>,
+
     /// Set to true by `stop_scan` to interrupt `collect_devices` early.
     /// Reset to false at the start of each new scan.
     stop_requested: Arc<AtomicBool>,
@@ -57,6 +79,8 @@ impl BluetoothScanner {
             is_scanning: Arc::new(Mutex::new(false)),
             discovered_devices: Arc::new(Mutex::new(HashMap::new())),
             discovered_peripherals: Arc::new(Mutex::new(HashMap::new())),
+            sent_addresses: Arc::new(Mutex::new(HashSet::new())),
+            last_event_count: Arc::new(AtomicU32::new(0)),
             stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -98,6 +122,7 @@ impl BluetoothScanner {
 
         // Reset early-stop flag for this scan cycle
         self.stop_requested.store(false, Ordering::Relaxed);
+        self.last_event_count.store(0, Ordering::Relaxed);
 
         // Clear previous scan results
         {
@@ -120,10 +145,35 @@ impl BluetoothScanner {
             })?;
             peripherals.clear();
         }
+        {
+            let mut sent = self.sent_addresses.lock().map_err(|e| {
+                let error = BleError::InternalError(format!("Lock error: {}", e));
+                error.log_error();
+                error
+            })?;
+            sent.clear();
+        }
+
+        // Subscribe to the event stream BEFORE starting the scan. `events()` returns
+        // a broadcast-style subscription (AdapterManager::event_stream) — any
+        // advertisement the OS delivers between `start_scan()` and the moment
+        // `collect_devices` first calls `events().await` used to be silently lost.
+        // This was most visible on the very first scan of a session, where WinRT can
+        // start delivering advertisements within a few milliseconds of Start().
+        ble_debug!("start_scan: subscribing to event stream before adapter.start_scan()");
+        let events = self.adapter.events().await.map_err(|e| {
+            let error = BleError::ScanFailed(format!("Failed to get events: {}", e));
+            error.log_error();
+            error
+        })?;
 
         // Start scanning
         ble_debug!("Initiating adapter scan");
         ble_debug!("Scan filter: {:?}", ScanFilter::default());
+        ble_debug!(
+            "start_scan: extended_advertisements_requested={} (LJDC_BLE_EXTENDED_ADV)",
+            extended_advertisements_requested()
+        );
 
         ble_debug!("start_scan: calling adapter.start_scan()");
         let scan_result = self.adapter.start_scan(ScanFilter::default()).await;
@@ -138,7 +188,11 @@ impl BluetoothScanner {
             error
         })?;
 
-        let result = timeout(scan_duration, self.collect_devices(device_tx.clone(), self.stop_requested.clone())).await;
+        let result = timeout(
+            scan_duration,
+            self.collect_devices(events, device_tx.clone(), self.stop_requested.clone()),
+        )
+        .await;
         ble_debug!("start_scan: collect_devices finished (timeout or done)");
 
         // Stop scanning
@@ -171,8 +225,12 @@ impl BluetoothScanner {
         // Post-scan pass: re-query all peripherals from the adapter cache.
         // btleplug 0.12 on Linux may fire ServicesAdvertisement/PropertiesChanged events whose
         // UUIDs are stored by BlueZ but not forwarded via DeviceUpdated to our event stream.
-        // After stop_scan() the BlueZ cache is authoritative — querying it gives the final,
-        // fully-populated properties (name + service UUIDs) for every device seen during scan.
+        // After stop_scan() the BlueZ/WinRT cache is authoritative — querying it gives the
+        // final, fully-populated properties (name + service UUIDs) for every device seen
+        // during scan. Every address not already forwarded through device_tx this scan is
+        // published here, not just the ones whose services newly became non-empty — a
+        // device seen exactly once during the window (common for a single advertisement
+        // interval) was previously never published at all.
         match self.adapter.peripherals().await {
             Err(e) => ble_debug!("post-scan peripherals() ERROR: {}", e),
             Ok(peripherals) => {
@@ -192,19 +250,16 @@ impl BluetoothScanner {
                         );
                         self.cache_peripheral(address.clone(), peripheral.clone());
                         let device_info = Self::create_device_info(address.clone(), properties);
-                        let needs_update = if let Ok(mut devices) = self.discovered_devices.lock() {
-                            let stale = match devices.get(&address) {
-                                Some(old) => {
-                                    old.services.is_empty() && !device_info.services.is_empty()
-                                }
-                                None => true,
-                            };
+                        if let Ok(mut devices) = self.discovered_devices.lock() {
                             devices.insert(address.clone(), device_info.clone());
-                            stale
-                        } else {
-                            false
-                        };
-                        if needs_update {
+                        }
+                        let already_sent = self
+                            .sent_addresses
+                            .lock()
+                            .map(|set| set.contains(&address))
+                            .unwrap_or(false);
+                        if !already_sent {
+                            self.mark_sent(&address);
                             let _ = device_tx.send(device_info);
                         }
                     }
@@ -255,24 +310,14 @@ impl BluetoothScanner {
     /// - the outer `timeout` in `start_scan` fires.
     async fn collect_devices(
         &self,
+        mut events: std::pin::Pin<Box<dyn futures::Stream<Item = CentralEvent> + Send>>,
         device_tx: mpsc::UnboundedSender<DeviceInfo>,
         stop_requested: Arc<AtomicBool>,
     ) -> Result<(), BleError> {
         use btleplug::api::Peripheral as _;
 
-        ble_debug!("Starting device collection");
-
-        // Get events stream
-        let mut events = self.adapter.events().await.map_err(|e| {
-            let error = BleError::ScanFailed(format!("Failed to get events: {}", e));
-            error.log_error();
-            error
-        })?;
-
-        ble_debug!("Events stream created successfully");
-
         ble_debug!("collect_devices: events stream open, waiting for BLE events");
-        let mut event_count = 0;
+        let mut event_count: u32 = 0;
         let mut discovered_count = 0;
 
         while let Some(event) = events.next().await {
@@ -283,6 +328,7 @@ impl BluetoothScanner {
             }
 
             event_count += 1;
+            self.last_event_count.store(event_count, Ordering::Relaxed);
 
             match event {
                 CentralEvent::DeviceDiscovered(id) => {
@@ -309,6 +355,7 @@ impl BluetoothScanner {
                                 ble_error!("Failed to acquire device map lock");
                             }
 
+                            self.mark_sent(&address);
                             if device_tx.send(device_info).is_err() {
                                 ble_warn!("Failed to send device info through channel");
                             }
@@ -333,20 +380,23 @@ impl BluetoothScanner {
                                 device_info.rssi
                             );
 
-                            let should_send =
-                                if let Ok(mut devices) = self.discovered_devices.lock() {
-                                    let exists = devices.contains_key(&address);
-                                    devices.insert(address.clone(), device_info.clone());
-                                    exists
-                                } else {
-                                    ble_error!("Failed to acquire device map lock");
-                                    false
-                                };
+                            if let Ok(mut devices) = self.discovered_devices.lock() {
+                                devices.insert(address.clone(), device_info.clone());
+                            } else {
+                                ble_error!("Failed to acquire device map lock");
+                            }
 
-                            if should_send {
-                                if device_tx.send(device_info).is_err() {
-                                    ble_warn!("Failed to send device update through channel");
-                                }
+                            // Always forward — the adapter's peripheral cache survives
+                            // across scans (WinRT and BlueZ both keep it for the life of
+                            // the adapter), so a device already known from an earlier
+                            // scan in this session only ever emits DeviceUpdated, never
+                            // DeviceDiscovered again. Previously this branch forwarded
+                            // only if the address already existed in *this scan's*
+                            // (freshly cleared) map, which made the first update of every
+                            // such device silently disappear.
+                            self.mark_sent(&address);
+                            if device_tx.send(device_info).is_err() {
+                                ble_warn!("Failed to send device update through channel");
                             }
                         }
                     }
@@ -362,17 +412,12 @@ impl BluetoothScanner {
                                 self.cache_peripheral(address.clone(), peripheral);
                                 let device_info =
                                     Self::create_device_info(address.clone(), properties);
-                                let should_send =
-                                    if let Ok(mut devices) = self.discovered_devices.lock() {
-                                        let exists = devices.contains_key(&address);
-                                        devices.insert(address.clone(), device_info.clone());
-                                        exists
-                                    } else {
-                                        false
-                                    };
-                                if should_send {
-                                    let _ = device_tx.send(device_info);
+                                if let Ok(mut devices) = self.discovered_devices.lock() {
+                                    devices.insert(address.clone(), device_info.clone());
                                 }
+                                // See comment on the DeviceUpdated arm above — same reasoning.
+                                self.mark_sent(&address);
+                                let _ = device_tx.send(device_info);
                             }
                         }
                     }
@@ -433,6 +478,36 @@ impl BluetoothScanner {
             *scanning
         } else {
             false
+        }
+    }
+
+    /// Builds a report of the last (or current) scan for `get_last_scan_report()`.
+    /// `duration_s` is the timeout that was requested for that scan.
+    pub async fn build_scan_report(&self, duration_s: f64) -> ScanReport {
+        let adapter_state = match self.adapter.adapter_state().await {
+            Ok(state) => format!("{:?}", state),
+            Err(e) => {
+                ble_debug!("build_scan_report: adapter_state() failed: {}", e);
+                String::new()
+            }
+        };
+        let unique_devices = self
+            .discovered_devices
+            .lock()
+            .map(|d| d.len() as u32)
+            .unwrap_or(0);
+        ScanReport {
+            adapter_state,
+            raw_advertisements: self.last_event_count.load(Ordering::Relaxed),
+            unique_devices,
+            extended_adv_requested: extended_advertisements_requested(),
+            duration_s,
+        }
+    }
+
+    fn mark_sent(&self, address: &str) {
+        if let Ok(mut sent) = self.sent_addresses.lock() {
+            sent.insert(address.to_string());
         }
     }
 
