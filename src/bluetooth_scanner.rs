@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -35,7 +35,7 @@ pub struct BluetoothScanner {
     adapter: Arc<Adapter>,
 
     /// Tokio runtime for async operations
-    runtime: Arc<Runtime>,
+    runtime: Handle,
 
     /// Current scanning state
     is_scanning: Arc<Mutex<bool>>,
@@ -72,7 +72,7 @@ impl BluetoothScanner {
     ///
     /// # Returns
     /// A new BluetoothScanner instance
-    pub fn new(adapter: Arc<Adapter>, runtime: Arc<Runtime>) -> Self {
+    pub fn new(adapter: Arc<Adapter>, runtime: Handle) -> Self {
         Self {
             adapter,
             runtime,

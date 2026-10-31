@@ -4,7 +4,7 @@ use futures::StreamExt;
 use godot::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 
@@ -53,7 +53,7 @@ pub struct BleDevice {
     peripheral: Arc<Peripheral>,
 
     /// Tokio runtime for executing async operations
-    runtime: Arc<Runtime>,
+    runtime: Handle,
 
     /// Device Bluetooth address
     address: GString,
@@ -804,7 +804,7 @@ impl BleDevice {
     /// Internal constructor — called by BluetoothManager.
     pub fn new(
         peripheral: Peripheral,
-        runtime: Arc<Runtime>,
+        runtime: Handle,
         address: String,
         name: String,
         event_tx: Arc<Mutex<mpsc::UnboundedSender<BleDeviceEvent>>>,

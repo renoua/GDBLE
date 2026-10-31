@@ -494,7 +494,7 @@ impl BluetoothManager {
 
                 ble_debug!("Creating Bluetooth scanner");
                 if let Some(ref runtime_mgr) = self.runtime {
-                    let scanner = BluetoothScanner::new(adapter_arc, runtime_mgr.runtime());
+                    let scanner = BluetoothScanner::new(adapter_arc, runtime_mgr.handle());
                     self.scanner = Some(Arc::new(scanner));
                 }
 
@@ -864,7 +864,7 @@ impl BluetoothManager {
         }
 
         let runtime = match &self.runtime {
-            Some(r) => r.runtime(),
+            Some(r) => r.handle(),
             None => {
                 let error = BleError::InternalError("Runtime not available".to_string());
                 error.log_error();
@@ -1460,6 +1460,28 @@ impl BluetoothManager {
                 None
             }
         }
+    }
+
+    /// Bounded, explicit shutdown for application exit (called from GDScript before the scene
+    /// tree is torn down): stops the scan, disconnects the devices, gives the disconnects a
+    /// brief grace period, then stops the Tokio runtime waiting at most `timeout_ms`.
+    /// Never blocks longer than that, unlike dropping a multi-thread runtime implicitly.
+    #[func]
+    pub fn shutdown_runtime(&mut self, timeout_ms: i64) {
+        let had_devices = self
+            .devices
+            .lock()
+            .map(|devices| !devices.is_empty())
+            .unwrap_or(false);
+        let runtime = self.runtime.clone();
+        self.cleanup();
+        if let Some(runtime) = runtime {
+            if had_devices {
+                runtime.block_on(tokio::time::sleep(Duration::from_millis(100)));
+            }
+            runtime.shutdown(Duration::from_millis(timeout_ms.max(0) as u64));
+        }
+        ble_info!("BluetoothManager: runtime shut down");
     }
 
     /// Clean up resources when the node is destroyed

@@ -1,77 +1,80 @@
-use std::sync::Arc;
-use tokio::runtime::Runtime;
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio::runtime::{Handle, Runtime};
 
-/// RuntimeManager manages the Tokio async runtime for executing BLE operations
+/// RuntimeManager is the SINGLE owner of the Tokio runtime.
 ///
-/// This struct provides a centralized way to manage the Tokio runtime lifecycle
-/// and execute async tasks. It ensures that all async operations use the same
-/// runtime instance, preventing resource conflicts.
+/// Everything else (scanner, devices) only gets a [`Handle`]: a handle never owns the worker
+/// threads, so no Godot- or Tokio-side code can end up dropping the runtime (a multi-thread
+/// `Runtime` drop waits for its workers with no upper bound, and panics when dropped from
+/// inside an async context). Shutdown is explicit and bounded: see [`RuntimeManager::shutdown`].
 pub struct RuntimeManager {
-    runtime: Arc<Runtime>,
+    runtime: Mutex<Option<Runtime>>,
+    handle: Handle,
 }
 
 impl RuntimeManager {
     /// Creates a new RuntimeManager with a multi-threaded Tokio runtime
     ///
-    /// # Returns
-    /// A new RuntimeManager instance with an initialized runtime
-    ///
     /// # Panics
     /// Panics if the Tokio runtime cannot be created
     pub fn new() -> Self {
         let runtime = Runtime::new().expect("Failed to create Tokio runtime");
+        let handle = runtime.handle().clone();
         Self {
-            runtime: Arc::new(runtime),
+            runtime: Mutex::new(Some(runtime)),
+            handle,
         }
     }
 
-    /// Returns a cloned Arc reference to the underlying Tokio runtime
-    ///
-    /// This allows sharing the runtime across multiple components while
-    /// maintaining thread safety through Arc's reference counting.
-    ///
-    /// # Returns
-    /// An Arc-wrapped reference to the Runtime
-    pub fn runtime(&self) -> Arc<Runtime> {
-        self.runtime.clone()
+    /// Returns a handle to the runtime (cheap to clone, does not keep the runtime alive).
+    pub fn handle(&self) -> Handle {
+        self.handle.clone()
     }
 
-    /// Spawns an async task on the runtime
-    ///
-    /// This method schedules a future to run on the Tokio runtime's thread pool.
-    /// The task runs independently and its result is not directly returned.
-    ///
-    /// # Type Parameters
-    /// * `F` - A Future that is Send and has a 'static lifetime
-    ///
-    /// # Parameters
-    /// * `future` - The async task to execute
+    /// Spawns an async task on the runtime. After [`shutdown`](Self::shutdown) the task is
+    /// dropped without running.
     pub fn spawn<F>(&self, future: F)
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let _ = self.runtime.spawn(future);
+        let _ = self.handle.spawn(future);
     }
 
     /// Blocks the current thread until the future completes
     ///
     /// This method should be used sparingly as it blocks the calling thread.
-    /// Prefer using spawn() for non-blocking execution when possible.
-    ///
-    /// # Type Parameters
-    /// * `F` - A Future type
-    ///
-    /// # Parameters
-    /// * `future` - The async task to execute and wait for
-    ///
-    /// # Returns
-    /// The output of the completed future
     pub fn block_on<F>(&self, future: F) -> F::Output
     where
         F: std::future::Future,
     {
-        self.runtime.block_on(future)
+        self.handle.block_on(future)
+    }
+
+    /// Stops the runtime, waiting at most `timeout` for running tasks. Idempotent.
+    /// Must not be called from inside the runtime.
+    pub fn shutdown(&self, timeout: Duration) {
+        let runtime = match self.runtime.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(runtime) = runtime {
+            runtime.shutdown_timeout(timeout);
+        }
+    }
+}
+
+impl Drop for RuntimeManager {
+    fn drop(&mut self) {
+        // Never block while the Godot scene tree is torn down.
+        let runtime = match self.runtime.get_mut() {
+            Ok(slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(runtime) = runtime {
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -85,21 +88,40 @@ impl Default for RuntimeManager {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_runtime_manager_creation() {
         let manager = RuntimeManager::new();
-        assert!(Arc::strong_count(&manager.runtime) == 1);
+        assert!(manager.runtime.lock().unwrap().is_some());
     }
 
     #[test]
-    fn test_runtime_clone() {
+    fn test_shutdown_is_bounded_with_a_task_that_never_ends() {
         let manager = RuntimeManager::new();
-        let runtime1 = manager.runtime();
-        let runtime2 = manager.runtime();
+        // A task parked on a blocking sleep cannot be cancelled by the runtime.
+        manager.spawn(async {
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        manager.shutdown(Duration::from_millis(200));
+        assert!(start.elapsed() < Duration::from_secs(2), "shutdown must be bounded");
+        // Idempotent, and spawning afterwards must not panic.
+        manager.shutdown(Duration::from_millis(10));
+        manager.spawn(async {});
+    }
 
-        // Both should point to the same runtime
-        assert!(Arc::ptr_eq(&runtime1, &runtime2));
+    #[test]
+    fn test_drop_does_not_block() {
+        let manager = RuntimeManager::new();
+        manager.spawn(async {
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        drop(manager);
+        assert!(start.elapsed() < Duration::from_secs(2), "drop must not wait for workers");
     }
 
     #[test]
