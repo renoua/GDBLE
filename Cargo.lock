@@ -261,6 +261,8 @@ dependencies = [
  "btleplug",
  "futures",
  "godot",
+ "jni",
+ "once_cell",
  "tokio",
  "windows",
 ]

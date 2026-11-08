@@ -19,12 +19,27 @@ impl RuntimeManager {
     /// # Panics
     /// Panics if the Tokio runtime cannot be created
     pub fn new() -> Self {
-        let runtime = Runtime::new().expect("Failed to create Tokio runtime");
+        let runtime = Self::build_runtime();
         let handle = runtime.handle().clone();
         Self {
             runtime: Mutex::new(Some(runtime)),
             handle,
         }
+    }
+
+    #[cfg(target_os = "android")]
+    fn build_runtime() -> Runtime {
+        // droidplug calls into the JVM from async tasks: every worker thread must be attached.
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .on_thread_start(crate::android::attach_current_thread)
+            .build()
+            .expect("Failed to create Tokio runtime")
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn build_runtime() -> Runtime {
+        Runtime::new().expect("Failed to create Tokio runtime")
     }
 
     /// Returns a handle to the runtime (cheap to clone, does not keep the runtime alive).

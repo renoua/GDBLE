@@ -1,6 +1,8 @@
 use godot::prelude::*;
 
 // Module declarations
+#[cfg(target_os = "android")]
+pub mod android;
 mod ble_characteristic;
 mod ble_device;
 mod ble_service;

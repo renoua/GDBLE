@@ -77,7 +77,7 @@ class Peripheral {
                     } else if (this.gatt == null) {
                         try {
                             this.setCommandCallback(callback);
-                            this.gatt = this.device.connectGatt(null, false, this.callback);
+                            this.gatt = this.device.connectGatt(null, false, this.callback, BluetoothDevice.TRANSPORT_LE);
                         } catch (SecurityException ex) {
                             throw new PermissionDeniedException(ex);
                         }

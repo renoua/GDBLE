@@ -1023,6 +1023,15 @@ impl BluetoothManager {
     async fn get_adapter_async() -> Result<Adapter, BleError> {
         use btleplug::api::{Central as _, CentralState};
 
+        // On Android btleplug needs a JNIEnv handed over by LjdcBlePlugin (Java) first;
+        // without it `Manager::new()` panics.
+        #[cfg(target_os = "android")]
+        if !crate::android::is_initialized() {
+            return Err(BleError::InitializationFailed(
+                "android_not_initialized".to_string(),
+            ));
+        }
+
         let manager = Manager::new()
             .await
             .map_err(|e| BleError::InitializationFailed(e.to_string()))?;

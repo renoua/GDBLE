@@ -1,0 +1,76 @@
+name: Android BLE (libs + plugin)
+
+# Produit :
+#  - (dans ljdc) addons/gdble_ljdc/bin/android/{arm64-v8a,x86_64}/libgdble_ljdc.so  (crate Rust)
+#  - addons/ljdc_android_ble/bin/ljdc_ble-{debug,release}.aar            (pont Java/JNI)
+# Télécharger l'artefact « android-ble » et copier les fichiers aux chemins ci-dessus.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['android-ble-*']
+
+jobs:
+  rust-libs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Installer cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Compiler les bibliothèques
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 --platform 24 -o out build --release
+          ls -l out/*/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-ble-libs
+          path: out/*/libgdble_ljdc.so
+
+  plugin-aar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compiler les AAR
+        working-directory: android_plugin
+        run: gradle :ljdc_ble:assembleDebug :ljdc_ble:assembleRelease
+
+      - name: Renommer
+        run: |
+          mkdir -p out
+          cp android_plugin/ljdc_ble/build/outputs/aar/ljdc_ble-debug.aar out/
+          cp android_plugin/ljdc_ble/build/outputs/aar/ljdc_ble-release.aar out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-ble-aar
+          path: out/*.aar
