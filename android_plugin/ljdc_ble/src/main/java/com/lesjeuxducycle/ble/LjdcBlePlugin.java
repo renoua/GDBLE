@@ -12,8 +12,6 @@ import android.os.Build;
 import android.provider.Settings;
 import android.util.Log;
 
-import androidx.annotation.NonNull;
-
 import org.godotengine.godot.Godot;
 import org.godotengine.godot.plugin.GodotPlugin;
 import org.godotengine.godot.plugin.SignalInfo;
@@ -60,13 +58,11 @@ public class LjdcBlePlugin extends GodotPlugin {
         }
     }
 
-    @NonNull
     @Override
     public String getPluginName() {
         return "LjdcBle";
     }
 
-    @NonNull
     @Override
     public Set<SignalInfo> getPluginSignals() {
         Set<SignalInfo> signals = new HashSet<>();
