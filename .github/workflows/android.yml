@@ -54,7 +54,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      # Le SDK Android est préinstallé sur ubuntu-latest (setup-android@v3 échoue sur le
+      # paquet obsolète « tools ») : on accepte les licences et on garantit la plateforme 35.
+      - name: Préparer le SDK Android
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
