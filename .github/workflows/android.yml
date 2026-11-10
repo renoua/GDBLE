@@ -23,7 +23,7 @@ jobs:
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
-          ndk-version: r27c
+          ndk-version: r28c   # r28+ : bibliothèques alignées sur 16 Ko par défaut (exigence Google Play)
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -35,9 +35,26 @@ jobs:
       - name: Compiler les bibliothèques
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          # Ceinture et bretelles : alignement 16 Ko explicite, quelle que soit la version du NDK.
+          RUSTFLAGS: -C link-arg=-Wl,-z,max-page-size=16384
         run: |
           cargo ndk -t arm64-v8a -t x86_64 --platform 24 -o out build --release
           ls -l out/*/
+
+      # Google Play refuse les appli ciblant Android 15+ dont une bibliothèque native a un segment
+      # PT_LOAD aligné sur moins de 16 Ko (0x4000) : on échoue ici plutôt qu'à l'envoi.
+      - name: Vérifier l'alignement 16 Ko et le symbole JNI
+        run: |
+          set -e
+          for so in out/*/libgdble_ljdc.so; do
+            echo "== $so"
+            readelf -lW "$so" | awk '$1=="LOAD" {print $NF}' | sort -u
+            if readelf -lW "$so" | awk '$1=="LOAD" {print $NF}' | grep -vq '^0x4000$\|^0x10000$'; then
+              echo "::error::$so n'est pas aligné sur 16 Ko"; exit 1
+            fi
+            nm -D "$so" | grep -q 'Java_com_lesjeuxducycle_ble_LjdcBlePlugin_nativeInit' \
+              || { echo "::error::$so n'exporte pas nativeInit (JNI)"; exit 1; }
+          done
 
       - uses: actions/upload-artifact@v4
         with:
