@@ -1486,7 +1486,11 @@ impl BluetoothManager {
         self.cleanup();
         if let Some(runtime) = runtime {
             if had_devices {
-                runtime.block_on(tokio::time::sleep(Duration::from_millis(100)));
+                // `tokio::time::sleep()` exige un contexte Tokio dès sa construction : l'appeler
+                // hors d'un `async` faisait paniquer (« there is no reactor running »).
+                runtime.block_on(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                });
             }
             runtime.shutdown(Duration::from_millis(timeout_ms.max(0) as u64));
         }
